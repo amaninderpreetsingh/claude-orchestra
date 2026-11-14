@@ -1,0 +1,8 @@
+# local run notes (contain personal identifiers) — never commit
+/SPEC-DRAFT.md
+/HANDOFF.md
+/audit/
+.DS_Store
+__pycache__/
+*.log
+.claude/
