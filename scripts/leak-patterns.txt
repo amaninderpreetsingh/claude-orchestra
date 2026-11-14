@@ -1,0 +1,28 @@
+# Leak-check identifier list, read by scripts/leak-check.sh.
+#
+# Why hashes: this repo is public, so the list of personal identifiers it must never contain
+# should not itself be written here in plain text (or base64, which is just as readable).
+# Each entry is the sha256 of a lowercase token; leak-check hashes every substring of the
+# same length in each scanned line and compares. The raw tokens never appear in the repo.
+# This deters casual reading and keeps the list from matching itself; it is NOT secrecy — a
+# short name or an 8-hex-digit id prefix can be recovered from its hash by brute force.
+#
+# Format:  <kind> <length> <sha256-hex> <label>
+#   word    matched inside one alphanumeric run (case-insensitive), e.g. a name, an id prefix
+#   joined  matched after dropping '-', '_', '.' and spaces, so "a-b", "a b", "A_B", "ab" all hit
+# The repo owner's public GitHub handle is never a leak, so no entry may match inside it (or
+# GitHub's own URLs, merge titles, branch names and noreply emails would fail CI for good):
+# list specific personal forms (full name, joined name, email local part), not a bare surname.
+#
+# Add an entry:  printf '%s' '<token>' | tr 'A-Z' 'a-z' | shasum -a 256   (never commit the token)
+word 6 c6cb6d753a2caea80d619196408355b4dd231ce14f41ff2273e6862219b0bc57 id-1
+word 6 862b6768f8cf13575173fd67ae9994d8cb83d3f5c8df383fe6dd206413c170c4 id-3
+word 5 84ba00cfed78a0d6b34f314ebbf518c9ebc267b5dac3149e11a763fedcec61f0 id-4
+word 10 55f52beaaf4e298749cff3c3b9649d282e92511da4f08a28de874db4da3d35c8 id-5
+word 8 6d7348618f6e332ad50a9731ad338e556859c187f061d74f2842134ea68477ba id-6
+word 8 830e57622db10eb64a7330f18c369c4a0f24da39119bdccabe0626f34a627e64 id-7
+joined 10 0518f1dcbbe79eb67962953d923b2b76bb3056816ea71026efdb2a16f5537102 id-8
+joined 9 82e0718c28b61bb8915f6c212d1aa1b7dbe8272df22127957646d90fe304d960 id-9
+joined 11 389f06b4b73b7337fd0fb62f6524a8945d72e45eee0e8e135b9a5bd6e05aab51 id-10
+joined 11 db972270dc5ec362c24d6e0ca6c81b43350f87c2ff8efa368a3594170f1f147b id-11
+word 8 1e06f7d4a7281fc304d5acd289a0d015defecb7dd7281af6fd667ffecc61d57d id-12

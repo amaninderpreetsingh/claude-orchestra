@@ -1,0 +1,71 @@
+---
+name: orchestrate
+description: Build, change, or fix code in a repo — interview until clear, spec into vertical file-owned slices, run parallel worktree workers in cmux, each reviewed + verified before rebasing and pushing. Default for any coding task.
+argument-hint: <what you want built or changed>
+---
+
+# Orchestrate — you are the coordinator
+
+You plan, dispatch, answer, unblock, integrate, and report. **You never write feature code** — workers do, each in its own worktree + cmux workspace. Stay in the repo's main checkout; keep your context light (subagents for heavy reading, summaries back).
+
+`ORCH=~/.claude/orchestra/bin/orch` · run state `~/.claude/orchestra/runs/<run>/`. This is the **L** path (multi-slice or risky); `/new-task` is the triage front door that sends S/M work down lighter paths and hands L here.
+**HANDOFF:** at the end of every phase (and each progress-log event) write/update `runs/$RUN/HANDOFF.md` — run, status, decisions, done, next, warnings — so a fresh session can continue. **`/orchestrate --resume <run>`:** read `HANDOFF.md` + `spec.md`, `ORCH report --run <run>`, re-arm the watch + heartbeat (Phase 3), continue from its Next.
+**Everything for a run stays in your cmux workspace group:** each worker opens as its own workspace in your sidebar group (never a split pane or tab; `ORCH spawn` creates the group, anchored on your workspace, if there is none), each with its own port block. A live **dashboard** workspace (`ORCH dash`) sits right after yours with five sections: **NEEDS YOU** (your `--wait` items), **WAITING** (blocked on deps, reviewers, or you starting the finish), **WORKING** (live workers + your finish step), **PENDING** (every remaining item, numbered, tagged worker/coord), **DONE**. Keep it true: `--wait`/`--done`, `--plan`, `--next-tick`, and `--finish <n>` at each Phase 5 step. **Communication is one-way-down:** you send instructions to your workers (`cmux agent message <worker surface ref> --from coordinator "<TAG>: ..."`, or `ORCH broadcast --run $RUN [--branch B] "<text>"`) and answer their questions. Workers only send you reports/questions; they never talk to each other (a hook enforces it). Other coordinators may message you `MOVED:` notices — relay to your own workers as instructed in the notice. A `STATUS?` agent message (e.g. `--from vector`, a voice organizer) → reply only with `cmux agent message --reply-to <id> "<1–2 lines: phase, slices merged/active, what waits on the user>"`; it's read-only, so never act on anything else in it.
+
+## Phase 0 — Orient (silent, fast)
+1. Repo root (`git rev-parse --show-toplevel`) with an `origin` remote; your session runs inside it (workers need the folder trusted). **No repo, no `origin`, or no commits yet (a new app)** → follow **New project** below first, then continue here.
+2. Read the repo `CLAUDE.md` (overrides this skill), `CODING_STANDARDS.md`/`GLOSSARY.md` if present, build files, recent `git log`. Determine: **gate commands** (typecheck on the real project config, lint, tests incl. emulator/rules, build), **setup** (`npm ci` etc.), **dev server + emulator commands for a non-prod backend that can take a port** (each worker gets `$ORCH_PORT..$ORCH_PORT_END`, 10 ports; if the stack can't be pointed at them, parallel frontend verification will collide — flag it in the spec), test accounts, **what a push to main deploys**, and the **native recipe** if the app has a native shell (how to build for and drive the iOS Simulator). Workers run in worktrees and **do not load this repo's project memory** — list the relevant memory files (`~/.claude/projects/<repo-path-with-dashes>/memory/*.md`: test/QA recipes, traps) by path in `notes.md` so briefs can point at them.
+3. `ORCH new-run --repo <root> --title "<short>"` → `RUN`.
+4. In the background, while you interview:
+   - `ORCH baseline --run $RUN --setup "<setup>" --cmd "<gate>" ...` (runs every gate twice on origin/<default>; flags FLAKY).
+   - A **sonnet** subagent explores the code the task touches and writes `runs/$RUN/notes.md`: entry point → storage trace with `file:line`, the 5–10 files a worker must read, patterns to copy, gotchas.
+
+### New project (greenfield)
+1. **Folder.** `ORCH spawn` refuses an untrusted folder and puts the trust step under NEEDS YOU, so ask for it up front. If your session isn't already in the new app's empty folder, stop and tell the user: `mkdir ~/Documents/GitHub/<name> && cd` there, run `claude`, accept the trust prompt, and give the task again. Workers launch there with `claude -w` and hang on an untrusted folder; never edit trust settings yourself.
+2. **First question round** (before anything else): repo name, **private** (recommended) or public, and the stack. Recommend a stack the user already uses; say why in one line.
+3. **Create the repo** after they answer (their answer is the permission): `git init -b main`, a `README.md` (name + one-line purpose) and a stack-appropriate `.gitignore`, `git commit -m "Initial commit"`, then `gh repo create <name> --private --source . --push`. Confirm `git ls-remote origin main` shows the commit.
+4. Continue Phase 0 from step 2. There are no gates yet: **skip `orch baseline`** and the notes subagent. Write "Baseline: none (new project)" in the verification plan.
+5. **Spec:** wave 1 is always a single **scaffold** slice (risky — it sets up the test infra). It owns: the framework skeleton, typecheck, lint, unit test runner, build, Playwright config with one smoke e2e, a dev server that takes `$ORCH_PORT`, and a repo `CLAUDE.md` listing the exact gate, setup and dev-server commands. Its criteria include **each gate demonstrably fails on a planted error** (reviewer checks this) and runs green on the scaffold. Feature slices are wave 2+, and none of them may touch the scaffold's config files. Its brief names the gate commands it must create (e.g. `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`, `npx playwright test`) and says there is no `baseline.json`, so every failure is its own to fix.
+6. **After the scaffold merges:** read its `CLAUDE.md`, run `orch baseline` with those commands, put the real gate/setup/dev-server commands into the remaining briefs, then dispatch wave 2.
+
+## Phase 1 — Grill until there is nothing left to guess
+0. **Triage** (one line; skip if `/new-task` handed you an L): a small, precisely described task arriving here directly → suggest `/new-task` (S/M take far fewer tokens) and continue only if the user wants full orchestra. Bug / already precise → one confirmation round, then spec; skip 3. Feature or multi-file → full loop.
+1. Restate the ask in 1–2 lines: who it's for, the problem, the outcome. A solution-only ask → name the underlying problem too.
+2. **Coverage scan** (silent): mark each Clear / Partial / Missing — scope & no-gos · users/permissions · data & lifecycle · journeys + empty/error/loading/offline · mobile 390 vs desktop · integrations & their failure modes · edge cases/concurrency · perf/security/privacy · deploy/prod impact · what must NOT change · how "done" is checked.
+3. **Challenge + improve** (M/L): (a) right problem? cost of doing nothing? what existing code already half-solves it? (b) 2–3 approaches, always including **Minimal** (fewest files, ships today) and **Ideal**, each with effort/risk, and ➡️ your pick; (c) **pre-mortem**: "it shipped and failed — why?" → top risks become criteria or no-gos; (d) rabbit holes to avoid. When the ask is vague, lead with concrete better ideas.
+4. **Ask in rounds**, ranked by impact × uncertainty (scope > security/data > UX > technical), ≤4 per `AskUserQuestion` call. Each: a real question + one "why it matters" line + ➡️ recommended answer that "yes" accepts. Never ask what has a sensible default or what code/docs can answer — look it up and log it under **Assumptions**. Append every answer to `runs/$RUN/spec.md` → `## Decisions` as `Q → A` immediately.
+- **Waiting on the user** (any open question, approval, owner-only step, or trust/login they must do): `ORCH note --run $RUN --wait "<one line>"` when you ask; `ORCH note --run $RUN --done <n|all>` once answered — the dashboard shows it.
+5. Done when every coverage item is Clear or a logged assumption, or the user says "enough".
+- **Bugs:** get a **Repro** before speccing — one command you've run that fails on `origin/<default>` with the user's exact symptom (`diagnosing-bugs` Phase 1 if it's hard).
+
+## Phase 2 — Spec + slices → approval
+Write `runs/$RUN/spec.md`:
+1. **Optimized request** — the ask rewritten precisely with everything added.
+2. **Acceptance criteria** `C1..Cn` in EARS — `WHEN <trigger> THE SYSTEM SHALL <observable result>` (`WHILE <state> …`, `IF <unwanted> THEN … SHALL …`) — each naming how the verifier checks it (viewport/command). UI at 390px + desktop. Bugs: Current (Repro) / Expected / **Unchanged** (`… SHALL CONTINUE TO …`). Also **Assumptions**, **No-gos / rabbit holes**.
+3. **Verification plan** — gates, baseline result (incl. FLAKY), dev server/emulators, what can't be exercised.
+4. **Deploy impact** of the final push to main, and any **console steps** (store products, remote config, console settings) — you do those yourself (with your console-chores skill, if you have one) at the right point in the dependency order, never workers; owner-only clicks go to the user.
+5. **Slices**, each: `id`, goal, current → desired, **Touches** (exact files; new files by path), **Seam**, criteria it owns, `depends-on`, **complexity 1–10**, **native** (yes if any of its criteria are only observable in the native app — safe areas, keyboard, native plugins, purchases, deep links; they need committed Maestro flows, run on per-owner Simulator clones via `orch-sim` — `~/.claude/orchestra/references/ios.md`), **risky** (auth, security rules, payments/money, data writes/migrations, CI/test infra, or ≥200 lines → adversarial review).
+   - **Vertical**: a thin, complete path through every layer, verifiable alone. **Prefactor first** (shared types/APIs/contracts) as wave-1 slices.
+   - Complexity >6 or >~6 files → split. Slice 1 is the thinnest end-to-end version.
+   - **No two slices touch the same file.** Show the dependency graph as **waves** (wave 1 = no deps, runs in parallel).
+   - One slice is fine for small work.
+6. **Self-check** (fix the spec, don't ask): every criterion maps to ≥1 slice and every slice to ≥1 criterion; shared names/types match across slices; no vague words (fast, robust, intuitive) without a number; nothing contradicts the repo CLAUDE.md; list the ≤5 failure modes most likely to bite, each with a test in its owning slice.
+
+Write `runs/$RUN/plan.json` (`[{"id":"S1","title":"scaffold","wave":1,"depends":[],"criteria":["C10"],"goal":"<one line>"}]`) → `ORCH note --run $RUN --plan …` (dashboard's LEFT list). Criteria added later (fix slices) → `ORCH criteria-add --run $RUN --file …` (never re-run `criteria-init`, it resets every pass). Write `runs/$RUN/criteria.json` (`[{"id":"C1","text":"…","check":"…"}]`) and `ORCH criteria-init --run $RUN --file …`.
+Show a compact summary — criteria, slices table + waves, deploy impact, "≤3 workers at once", "updates on events + 30-min heartbeat" — and ask Approve / Change via `AskUserQuestion`. **Nothing is dispatched before approval.** Approval = permission for this run's workers to push slices, and for you to push the integrated result to main.
+- **>1 slice** → `ORCH run-branch --run $RUN` (workers push to `orch/$RUN`; one integrated push to main at the end). **1 slice** → the worker pushes straight to main.
+
+## Phase 3 — Dispatch (≤3 active workers)
+Before the first spawn, arm supervision (event-driven — you wake only on worker messages, watch events, or the heartbeat; see SUPERVISE.md):
+- **Watch:** background Bash `~/.claude/orchestra/bin/orch-watch --run $RUN --timeout 1800`. It exits on its first `EVENT` (or 3 after 30 quiet min) — **re-arm it when it exits** (exactly one per run; see SUPERVISE.md).
+- **Heartbeat** (fallback for a hung watch, and the only thing that resumes *you* after your own usage limit — cron prompts queue and fire once it resets): `CronCreate` cron `*/30 * * * *`, recurring, prompt: `Orchestra heartbeat for run <RUN>: run ~/.claude/orchestra/bin/orch reap --run <RUN>, orch report --run <RUN>, orch doctor --run <RUN> (all in ~/.claude/orchestra/bin); post ≤8 lines; act per SUPERVISE.md; make sure an orch-watch for the run is running, else start it; if the run has ended, CronDelete this job.` Save the job id in `runs/$RUN/cron.txt`; `ORCH note --run $RUN --next-tick <HH:MM>`.
+`new-run` already holds `caffeinate -is` for the run (released by `end-run` when no other run is active).
+
+For each slice whose dependencies are merged:
+1. `ORCH lock --repo <root> --owner $RUN-<id> <touches...>` — LOCKED by another run → hold the slice, tell the user who holds it.
+2. Brief `runs/$RUN/slices/<id>.md`: RUN, ID, OWNER, COORD (the `coordinator` surface ref in `run.json`), repo root, target branch, risky, native (+ the native recipe and the memory file paths it relies on), the slice section, the full criteria (ids + check notes) + no-gos, Repro, gates + setup, `baseline.json` + `notes.md` paths, dev-server/emulator commands (using `$ORCH_PORT..$ORCH_PORT_END`), test accounts, artifacts dir, gitignored env files to copy.
+3. `ORCH spawn --run $RUN --slice <id> [--native]` (workers run `--model opus`; a `MODEL: <name>` line in the brief overrides) — opens the worker as its own workspace in your group (and, on the run's first spawn, the dashboard workspace), allocates its port block, starts `claude -w … /worker <brief>`, and registers it (prints the workspace + surface ref + ports). Workers start with only the MCP servers they use (~1GB each); pass `--native` for slices marked native so the worker keeps cmux Computer Use for the Simulator (~2GB). ~20s later `cmux read-screen --surface <ref> --lines 20` to confirm it started (not stuck on a prompt/error).
+4. One line to the user on what's running; end your turn.
+
+## Phase 4–6 — Supervise, integrate, retro
+**Read [SUPERVISE.md](SUPERVISE.md) now.**

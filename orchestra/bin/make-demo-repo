@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Create a throwaway repo (with a local bare "origin", so pushes never leave your Mac)
+# for an end-to-end test of /orchestrate, then open it in a new cmux workspace.
+#   make-demo-repo [dir]     (default: ~/orchestra-demo)
+set -euo pipefail
+DIR="${1:-$HOME/orchestra-demo}"
+if [ -e "$DIR" ]; then echo "$DIR exists — pass another path or remove it first" >&2; exit 1; fi
+mkdir -p "$DIR"; cd "$DIR"
+git init -q --bare -b main origin.git
+git clone -q origin.git app 2>/dev/null; cd app
+cat > package.json <<'EOF'
+{ "name": "orchestra-demo", "private": true, "type": "module",
+  "scripts": { "test": "node --test", "dev": "node server.js" } }
+EOF
+cat > server.js <<'EOF'
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+const port = Number(process.env.PORT || 3000);
+createServer(async (req, res) => {
+  const file = req.url === '/' ? 'index.html' : req.url.slice(1);
+  try { res.end(await readFile(new URL(file, import.meta.url))); }
+  catch { res.statusCode = 404; res.end('not found'); }
+}).listen(port, () => console.log(`ready on http://localhost:${port}`));
+EOF
+cat > index.html <<'EOF'
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tip Calculator</title></head>
+<body><h1>Tip Calculator</h1><p>Coming soon.</p><script type="module" src="app.js"></script></body></html>
+EOF
+echo "// app code goes here" > app.js
+cat > CLAUDE.md <<'EOF'
+# Orchestra demo app
+- Plain Node + static HTML, no build step. Gates: `npm test`.
+- Dev server: `PORT=<port> npm run dev` (any free port). No backend, nothing deploys — origin is a local bare repo.
+- Conventional commits, no trailers.
+EOF
+printf 'node_modules/\n' > .gitignore
+git add . && git commit -qm "chore: demo app skeleton" && git push -q origin main && git remote set-head origin main
+echo "Demo repo ready: $DIR/app"
+if command -v cmux >/dev/null; then
+  cmux new-workspace --name "orchestra-demo" --cwd "$DIR/app" --focus true --command "claude" >/dev/null 2>&1 \
+    && echo "Opened a cmux workspace 'orchestra-demo' running claude (accept the folder-trust prompt once)."
+fi
+cat <<EOF
+
+Try (in that chat):
+  /orchestrate Build a tip calculator page: bill amount, tip % buttons (15/18/20/custom),
+  split between N people, per-person total. Mobile first. Pure JS module for the math.
+EOF

@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Claude Code status line: this chat's context %, plus 5-hour and weekly plan usage % with reset times."""
+import json, sys, time, pathlib
+
+raw = sys.stdin.read()
+log = pathlib.Path.home() / ".claude/statusline/inputs"
+try:
+    d = json.loads(raw)
+except Exception:
+    print("statusline: bad input"); sys.exit(0)
+try:  # keep the latest raw input per session (for debugging which fields Claude Code sends)
+    log.mkdir(exist_ok=True)
+    (log / f"{d.get('session_id', 'unknown')}.json").write_text(raw)
+except Exception:
+    pass
+
+G, Y, R, DIM, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+
+def pct(v):
+    c = G if v < 50 else Y if v < 80 else R
+    return f"{c}{v:.0f}%{X}"
+
+def reset(ts):
+    if not ts:
+        return ""
+    if isinstance(ts, str):  # ISO 8601
+        from datetime import datetime
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return ""
+    left = ts - time.time()
+    when = time.strftime("%H:%M" if left < 86400 else "%a %H:%M", time.localtime(ts))
+    h, m = int(max(left, 0) // 3600), int(max(left, 0) % 3600 // 60)
+    return f" {DIM}↻ {when} ({f'{h // 24}d{h % 24}h' if h >= 24 else f'{h}h{m:02d}m'}){X}"
+
+parts = [d.get("model", {}).get("display_name", "?")]
+cw = d.get("context_window") or {}
+if cw.get("used_percentage") is not None:
+    parts.append(f"ctx {pct(cw['used_percentage'])}")
+
+rl = d.get("rate_limits") or {}
+for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+    w = rl.get(key) or {}
+    if w.get("used_percentage") is not None:
+        parts.append(f"{label} {pct(w['used_percentage'])}{reset(w.get('resets_at'))}")
+if not rl:
+    parts.append(f"{DIM}usage: after first reply{X}")
+
+print(" │ ".join(parts))

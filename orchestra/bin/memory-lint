@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""memory-lint — check a project memory dir. Read-only.
+
+    memory-lint <memory dir>
+
+Every top-level *.md except MEMORY.md is a memory: it needs frontmatter with
+name, description and metadata.type (a top-level type is accepted as the legacy form), a unique name, and a line in MEMORY.md.
+Every relative .md link in MEMORY.md must point at an existing file.
+Prints one line per problem; exit 0 clean, 1 problems, 2 usage.
+"""
+import os, re, sys
+
+LINK = re.compile(r"\]\(([^)\s]+)\)")
+
+
+def frontmatter(text):
+    """Return {key: value} for top-level keys plus 'metadata.<key>' for keys nested under metadata, or None."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    out, parent = {}, None
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            return out
+        m = re.match(r"^(\s*)([A-Za-z_][\w-]*):\s*(.*)$", ln)
+        if not m:
+            continue
+        indent, key, val = m.groups()
+        if not indent:
+            parent = key
+            out[key] = val.strip()
+        elif parent:
+            out[f"{parent}.{key}"] = val.strip()
+    return None  # no closing ---
+
+
+def lint(d):
+    problems, names = [], {}
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md") and f != "MEMORY.md" and os.path.isfile(os.path.join(d, f)))
+    for f in files:
+        with open(os.path.join(d, f), encoding="utf-8", errors="replace") as fh:
+            fm = frontmatter(fh.read())
+        if fm is None:
+            problems.append(f"{f}: missing frontmatter")
+            continue
+        fm.setdefault("metadata.type", fm.get("type"))  # legacy: top-level type
+        for key in ("name", "description", "metadata.type"):
+            if not fm.get(key):
+                problems.append(f"{f}: frontmatter missing {key}")
+        if fm.get("name"):
+            names.setdefault(fm["name"], []).append(f)
+    for name, fs in sorted(names.items()):
+        if len(fs) > 1:
+            problems.append(f"duplicate name {name}: {', '.join(fs)}")
+
+    idx = os.path.join(d, "MEMORY.md")
+    if not os.path.isfile(idx):
+        problems.append("MEMORY.md: missing")
+        return problems
+    indexed = set()
+    with open(idx, encoding="utf-8", errors="replace") as fh:
+        for n, ln in enumerate(fh, 1):
+            for target in LINK.findall(ln):
+                target = target.split("#")[0]
+                if "://" in target or not target.endswith(".md"):
+                    continue
+                indexed.add(os.path.normpath(target))
+                if not os.path.isfile(os.path.join(d, target)):
+                    problems.append(f"MEMORY.md: line {n}: {target} does not exist")
+    for f in files:
+        if f not in indexed:
+            problems.append(f"{f}: not indexed in MEMORY.md")
+    return problems
+
+
+def main():
+    if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
+        print("usage: memory-lint <memory dir>" if len(sys.argv) != 2 else f"memory-lint: not a directory: {sys.argv[1]}", file=sys.stderr)
+        return 2
+    problems = lint(sys.argv[1])
+    for p in problems:
+        print(p)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

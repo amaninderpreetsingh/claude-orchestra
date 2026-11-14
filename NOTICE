@@ -1,0 +1,12 @@
+claude-orchestra
+Copyright (c) 2026 claude-orchestra contributors — MIT License (see LICENSE).
+
+Third-party material
+--------------------
+The following skills are adapted from Matt Pocock's skills collection
+(github.com/mattpocock/skills), Copyright (c) 2026 Matt Pocock, MIT License.
+Each keeps its original license text beside it, as MIT requires:
+
+  skills/diagnosing-bugs/     skills/diagnosing-bugs/LICENSE.mattpocock
+  skills/retro/               skills/retro/LICENSE.mattpocock
+  skills/writing-for-agents/  skills/writing-for-agents/LICENSE.mattpocock

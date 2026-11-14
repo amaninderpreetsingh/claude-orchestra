@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""orch-watch — event-driven supervision for an orchestra run.
+
+    orch-watch --run R [--once] [--interval SECS] [--timeout SECS] [--stall-min M] [--coordinator]
+
+Polls the run's active workers (and, with --coordinator, the run's coordinator surface). On the
+first event prints one line `EVENT <kind> <slice> <detail>` and exits 0; exits 3 when the timeout
+passes (or after one poll with --once) with no event. Kinds:
+  DEAD         surface gone from `cmux tree`, or no claude process left on its tty
+  STALLED      no progress-file line for >= --stall-min minutes (workers only)
+  USAGE_LIMIT  the screen shows the Claude usage-limit banner; reset time recorded
+  RESUMED      the recorded reset time passed; "continue" + Enter was typed into the session
+An event is not re-emitted for the same slice until its state changes (state in
+ORCH_HOME/state/watch-<run>.json). Typical use: the coordinator runs
+`orch-watch --run R --timeout 1800` as a background command — it returns on an event or after 30 min.
+"""
+import argparse, json, os, re, subprocess, sys, time
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
+RUNS, STATE = HOME / "runs", HOME / "state"
+RESUME_GRACE = 30 * 60   # after resuming, a banner still on screen is the old one for this long
+BOTTOM = 12              # the banner sits just above the prompt box; only the screen's last non-blank lines count
+# Claude's limit line, opening the line (after the ⎿ gutter) and carrying a reset time; ordinary text that merely
+# mentions "usage limit reached" (code, logs, prose) doesn't open a line this way.
+BANNER = re.compile(r"^[\s⎿│●•·]*(?:claude(?: ai)? usage limit reached|you[’']ve hit your (?:usage )?limit"
+                    r"|(?:(?:\d+-hour|weekly|opus|sonnet|session)\s+)*limit reached)(?=.*\breset|\|\d{10})", re.I)
+RESET = re.compile(r"resets?(?:\s+at)?\s+(?:([A-Z][a-z]{2})\s+(\d{1,2}),?\s+(?:at\s+)?)?"
+                   r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b\s*(?:\(([^)]+)\))?", re.I)
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def write_json(p, data):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(p)
+
+
+def cmux(*args):
+    try:
+        r = subprocess.run(["cmux", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def live_surfaces():
+    """{ref: tty} for every live workspace/surface, or None when cmux can't tell (→ nobody is dead)."""
+    out = cmux("tree", "--all", "--json")
+    try:
+        tree = json.loads(out)
+    except Exception:
+        return None
+    live = {}
+    def walk(o):
+        if isinstance(o, dict):
+            ref = str(o.get("ref", ""))
+            if ref.startswith(("workspace:", "surface:")):
+                live[ref] = o.get("tty")
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(tree)
+    return live
+
+
+def claude_gone(tty):
+    """True only when ps lists the tty's processes and none of them is claude."""
+    try:
+        r = subprocess.run(["ps", "-o", "pid=,comm=", "-t", tty], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    procs = [ln.split(None, 1)[-1] for ln in r.stdout.splitlines() if ln.strip()]
+    return r.returncode == 0 and bool(procs) and not any("claude" in Path(p).name.lower() for p in procs)
+
+
+def flag(ref):
+    return "--workspace" if ref.startswith("workspace:") else "--surface"
+
+
+def parse_reset(text, now):
+    """Epoch of the reset time in a usage-limit banner; unparseable → now + 60 min."""
+    m = re.search(r"limit reached\|(\d{10})", text)
+    if m:
+        return float(m.group(1))
+    m = RESET.search(text)
+    if m and (m.group(4) or m.group(5)):
+        mon, day, hour, minute, ampm, tzname = m.groups()
+        hour, minute = int(hour), int(minute or 0)
+        if ampm:
+            hour = hour % 12 + (12 if ampm.lower() == "pm" else 0)
+        try:
+            tz = ZoneInfo(tzname.strip()) if tzname else None
+        except Exception:
+            tz = None
+        base = datetime.fromtimestamp(now, tz) if tz else datetime.fromtimestamp(now)
+        try:
+            at = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if mon:
+                at = at.replace(month=datetime.strptime(mon.title(), "%b").month, day=int(day))
+                if at.timestamp() <= now:
+                    at = at.replace(year=at.year + 1)
+            elif at.timestamp() <= now:
+                at += timedelta(days=1)
+            return at.timestamp()
+        except ValueError:
+            pass
+    return now + 3600
+
+
+def banner_text(screen):
+    """(line, text) of the last usage-limit banner in the screen's bottom area, or None. The line alone is the banner's
+    identity (the line under it changes once "continue" is typed); text adds the next line, in case the reset time wraps."""
+    lines = (screen or "").rstrip().splitlines()[-BOTTOM:]
+    hits = [(ln.strip(), " ".join(lines[i:i + 2])) for i, ln in enumerate(lines) if BANNER.search(" ".join(lines[i:i + 2]))]
+    return hits[-1] if hits else None
+
+
+def progressed(t, e):
+    """True when the slice's progress file got a line after the last resume."""
+    prog = t.get("progress")
+    return bool(prog and e.get("resumed_epoch") and prog.exists() and prog.stat().st_mtime > e["resumed_epoch"])
+
+
+def local_iso(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%dT%H:%M")
+
+
+def check(t, e, live, a, now):
+    """Event (kind, detail) for target t, updating its watch-state entry e in place; None if nothing new."""
+    ref = t["ref"]
+    dead = None
+    if live is not None:
+        if ref not in live:
+            dead = "surface-gone"
+        elif live[ref] and claude_gone(live[ref]):
+            dead = "no-claude"
+    def become(kind, **kw):  # new state; the last resume (time + banner) survives (stall clock restarts at a resume)
+        kept = {k: e[k] for k in ("resumed_epoch", "resumed_banner") if k in e and k not in kw}
+        e.clear(); e.update(kind=kind, **kw, **kept)
+
+    if dead:
+        if e.get("kind") == "DEAD":
+            return None
+        become("DEAD")
+        return "DEAD", f"{dead} {ref}"
+    def screen_banner():
+        return banner_text(cmux("read-screen", flag(ref), ref, "--lines", "40"))
+    hit = screen_banner()
+    banner = hit and hit[0]
+    if e.get("resumed_banner") and banner != e["resumed_banner"]:
+        del e["resumed_banner"]  # the resumed banner left the screen: one showing up later is a new limit
+    if banner and banner == e.get("resumed_banner") and progressed(t, e):
+        banner = None  # the old banner, still on screen: the slice has written progress since the resume
+    if e.get("kind") == "RESUMED" and banner:
+        if now - e.get("resumed_epoch", 0) < RESUME_GRACE:
+            return None
+        if banner == e.get("banner"):  # the same banner never went away: the resume didn't take, retry it
+            e.update(kind="USAGE_LIMIT", reset_epoch=now)
+    if e.get("kind") == "USAGE_LIMIT":
+        if now >= e.get("reset_epoch", 0) and banner:
+            if screen_banner() is None:  # re-read right before typing: gone → someone resumed it; next poll moves on
+                return None
+            # cmux send fails (sends nothing) when the prompt holds text or a dialog is open → retry next poll;
+            # once "continue" is typed, a failed Enter is retried alone (typing it again would fail on the held text)
+            if not e.get("typed"):
+                if cmux("send", flag(ref), ref, "continue") is None:
+                    return None
+                e["typed"] = True
+            if cmux("send-key", flag(ref), ref, "enter") is None:
+                return None
+            e.pop("typed")
+            e.update(kind="RESUMED", resumed_epoch=now, resumed_banner=banner)
+            return "RESUMED", e["reset_at"]
+        if banner:
+            return None
+    if banner:
+        reset = parse_reset(hit[1], now)
+        become("USAGE_LIMIT", reset_at=local_iso(reset), reset_epoch=reset, banner=banner)
+        return "USAGE_LIMIT", e["reset_at"]
+    if t.get("progress"):
+        prog = t["progress"]
+        since = max(prog.stat().st_mtime if prog.exists() else t.get("started") or now, e.get("resumed_epoch", 0))
+        age = now - since
+        if age >= a.stall_min * 60:
+            if e.get("kind") == "STALLED" and e.get("since") == since:
+                return None
+            become("STALLED", since=since)
+            return "STALLED", f"{int(age // 60)}m"
+    become("OK")
+    return None
+
+
+def targets(run_dir, r, a):
+    out = []
+    for w in sorted((run_dir / "workers").glob("*.json")):
+        wk = read_json(w) or {}
+        if wk.get("status") != "active" or not wk.get("workspace"):
+            continue
+        try:
+            started = datetime.fromisoformat(wk["started"]).timestamp()
+        except Exception:
+            started = None
+        out.append({"name": wk["slice"], "ref": wk["workspace"], "started": started,
+                    "progress": run_dir / "slices" / f"{wk['slice']}.progress.md"})
+    if a.coordinator and r.get("coordinator"):
+        out.append({"name": "coordinator", "ref": r["coordinator"]})
+    return out
+
+
+def poll(run_dir, r, a, state_path):
+    state = read_json(state_path, {})
+    live, now, event = live_surfaces(), time.time(), None
+    for t in targets(run_dir, r, a):
+        e = state.setdefault(t["name"], {})
+        hit = check(t, e, live, a, now)
+        if hit:
+            event = f"EVENT {hit[0]} {t['name']} {hit[1]}"
+            break
+    write_json(state_path, state)
+    return event
+
+
+def main():
+    p = argparse.ArgumentParser(prog="orch-watch", description=__doc__.split("\n\n")[0])
+    p.add_argument("--run", required=True)
+    p.add_argument("--once", action="store_true", help="poll once; exit 3 if nothing happened")
+    p.add_argument("--interval", type=float, default=60, help="seconds between polls (default 60)")
+    p.add_argument("--timeout", type=float, default=1800, help="exit 3 after this many seconds (default 1800)")
+    p.add_argument("--stall-min", type=float, default=15, help="minutes without a progress line = STALLED (default 15)")
+    p.add_argument("--coordinator", action="store_true", help="also watch the run's coordinator surface")
+    a = p.parse_args()
+    run_dir = RUNS / a.run
+    r = read_json(run_dir / "run.json") or sys.exit(f"orch-watch: no run {a.run}")
+    state_path = STATE / f"watch-{a.run}.json"
+    start = time.time()
+    while True:
+        event = poll(run_dir, r, a, state_path)
+        if event:
+            print(event, flush=True)
+            sys.exit(0)
+        left = a.timeout - (time.time() - start)
+        if a.once or left <= 0:
+            sys.exit(3)
+        time.sleep(min(a.interval, left))
+
+
+if __name__ == "__main__":
+    main()

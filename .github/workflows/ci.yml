@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # leak-check and gitleaks scan the full history
+
+      - name: Lint (bash -n, python compile, JSON)
+        run: bash scripts/lint.sh
+
+      - name: Test suites (isolated HOME/ORCH_HOME, stub cmux)
+        run: bash tests/run.sh
+
+      - name: Leak check (personal identifiers, machine paths)
+        run: bash scripts/leak-check.sh
+        env:
+          # On pull_request, HEAD is GitHub's synthetic test-merge (the opener's account identity,
+          # never part of the repo's history): scan the PR head instead. Empty on push → HEAD.
+          LEAK_REV: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install gitleaks
+        run: brew install gitleaks
+
+      - name: gitleaks (history)
+        run: gitleaks git --no-banner --redact .
+
+      - name: gitleaks (working tree)
+        run: gitleaks dir --no-banner --redact .

@@ -1,0 +1,1402 @@
+#!/usr/bin/env python3
+"""orch — state, locks, evidence and broadcast helper for the /orchestrate workflow.
+
+State lives in ~/.claude/orchestra/. Several coordinators (one per cmux chat) can run at
+once on the same or different repos. Anything exclusive (file ownership, pushing to a
+branch) is an atomic mkdir lock keyed by repo. Evidence (gate runs, reviewer/verifier
+verdicts, gates-ok) lives in the worktree's own git dir, so push-guard can check it.
+
+Coordinator:  new-run, run-branch, baseline, add-worker, lock/unlock/locks, criteria-init,
+              criteria-check, doctor, finish-worker, end-run, status, broadcast
+Worker:       register, gates, verdict, criterion, gates-ok, merge-lock/merge-unlock, merged
+Tier S:       tier (main checkout: gates + lite reviewer PASS, then push)
+Run `orch <cmd> -h` for flags.
+"""
+import argparse, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time
+from pathlib import Path
+
+HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
+RUNS, LOCKS, EVENTS = HOME / "runs", HOME / "locks", HOME / "events"
+CAFF_PID = HOME / "state" / "caffeinate.pid"  # one `caffeinate -is` shared by every active run
+MERGE_LOCK_MAX_SECS = 20 * 60          # lock covers only rebase+push, so this is generous
+PORT_BLOCK = 10                        # each worker gets its own 10-port block
+# tests set ORCH_PORT_BASE/SPAN to a private range: reap kills unowned listeners in the range, and an isolated
+# ORCH_HOME owns nothing outside itself (it killed live workers' and concurrent suites' servers)
+PORT_BASE = int(os.environ.get("ORCH_PORT_BASE", 20000))
+PORT_MAX = PORT_BASE + int(os.environ.get("ORCH_PORT_SPAN", 9990))
+PASS_ROLES = ("reviewer", "verifier")  # + "adversarial" when the worker is registered --risky
+
+
+# ---------------------------------------------------------------- helpers
+def run(args, cwd=None, check=True, timeout=None):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        sys.exit(f"orch: {' '.join(map(str, args))} failed: {r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout.strip()
+
+
+def git(cwd, *args, check=True):
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+def repo_root(path):
+    return str(Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent)
+
+
+def slug_of(path):
+    return re.sub(r"[^A-Za-z0-9]+", "-", repo_root(path)).strip("-")
+
+
+def git_dir(path):
+    return Path(git(path, "rev-parse", "--path-format=absolute", "--git-dir"))
+
+
+def default_branch(path):
+    r = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    return r.split("/", 1)[1] if "/" in r else "main"
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_json(p, data):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(p)
+
+
+def head(path):
+    return git(path, "rev-parse", "HEAD")
+
+
+def owner_info(path):
+    return read_json(git_dir(path) / "orchestra-owner.json")
+
+
+def patch_id(path, target):
+    """Stable id of this branch's own change relative to origin/<target> (survives clean rebases)."""
+    base = git(path, "merge-base", "HEAD", f"origin/{target}", check=False)
+    if not base:
+        return None
+    diff = subprocess.run(["git", "diff", base, "HEAD"], cwd=path, capture_output=True, text=True).stdout
+    if not diff:
+        return None
+    out = subprocess.run(["git", "patch-id", "--stable"], input=diff, capture_output=True, text=True).stdout
+    return out.split()[0] if out else None
+
+
+def cmux_identify():
+    try:
+        out = subprocess.run(["cmux", "identify", "--json"], capture_output=True, text=True, timeout=10)
+        return json.loads(out.stdout)["caller"]
+    except Exception:
+        return {}
+
+
+def cmux_workspace():
+    """This session's address: its cmux SURFACE (a workspace may hold a coordinator + worker panes)."""
+    return cmux_identify().get("surface_ref")
+
+
+def cmux_live_workspaces():
+    """Every live workspace and surface ref across all windows."""
+    try:
+        out = subprocess.run(["cmux", "tree", "--all", "--json"], capture_output=True, text=True, timeout=10).stdout
+        return set(re.findall(r'"ref"\s*:\s*"((?:workspace|surface):\d+)"', out))
+    except Exception:
+        return None  # unknown → never treat anyone as dead
+
+
+def cmux_group_for(workspace, key, name):
+    """The workspace group holding `workspace`; creates one anchored on it (idempotent per run) if none."""
+    try:
+        out = subprocess.run(["cmux", "workspace-group", "list", "--json"], capture_output=True, text=True, timeout=10).stdout
+        for g in json.loads(out).get("groups", []):
+            if workspace in g.get("member_workspace_refs", []):
+                if g.get("anchor_workspace_ref") == workspace:
+                    return g["ref"]
+                # coordinator sits in another group (stale run, or as a plain member): take it out so it heads a new one
+                subprocess.run(["cmux", "workspace-group", "remove", "--workspace", workspace],
+                               capture_output=True, text=True, timeout=10)
+                break
+    except Exception:
+        pass
+    out = subprocess.run(["cmux", "workspace-group", "create", "--name", name, "--from", workspace,
+                          "--idempotency-key", key], capture_output=True, text=True, timeout=10).stdout
+    m = re.search(r"workspace_group:\d+", out)
+    return m.group(0) if m else None
+
+
+def cmux_first_surface(workspace):
+    """First surface ref inside `workspace` (the terminal a new workspace starts with)."""
+    def walk(o, inside):
+        if isinstance(o, dict):
+            ref = str(o.get("ref", ""))
+            if ref.startswith("workspace:"):
+                inside = ref == workspace
+            if inside and ref.startswith("surface:"):
+                return ref
+            for v in o.values():
+                hit = walk(v, inside)
+                if hit:
+                    return hit
+        elif isinstance(o, list):
+            for v in o:
+                hit = walk(v, inside)
+                if hit:
+                    return hit
+        return None
+    try:
+        out = subprocess.run(["cmux", "tree", "--all", "--json"], capture_output=True, text=True, timeout=10).stdout
+        return walk(json.loads(out), False)
+    except Exception:
+        return None
+
+
+def port_in_use(p):
+    with socket.socket() as sk:
+        sk.settimeout(0.2)
+        return sk.connect_ex(("127.0.0.1", p)) == 0
+
+
+def alloc_ports(owner):
+    pd = LOCKS / "ports"
+    pd.mkdir(parents=True, exist_ok=True)
+    for x in pd.glob("*"):
+        if (read_json(x / "owner.json") or {}).get("owner") == owner:
+            return int(x.name)
+    for base in range(PORT_BASE, PORT_MAX, PORT_BLOCK):
+        if any(port_in_use(p) for p in range(base, base + PORT_BLOCK)):
+            continue
+        try:
+            (pd / str(base)).mkdir()
+        except FileExistsError:
+            continue
+        write_json(pd / str(base) / "owner.json", {"owner": owner, "at": now()})
+        return base
+    sys.exit("orch: no free port block")
+
+
+def release_ports(owner):
+    n = 0
+    for x in (LOCKS / "ports").glob("*"):
+        if (read_json(x / "owner.json") or {}).get("owner") == owner:
+            shutil.rmtree(x, ignore_errors=True)
+            n += 1
+    return n
+
+
+def cmux_message(target, text, sender):
+    if not target:
+        return False
+    try:
+        r = subprocess.run(["cmux", "agent", "message", target, "--from", sender, "--", text],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def runs_for(slug, status="active"):
+    for d in sorted(RUNS.glob("*")):
+        r = read_json(d / "run.json")
+        if r and r.get("repo_slug") == slug and (status is None or r.get("status") == status):
+            yield d, r
+
+
+def workers_of(run_dir, status="active"):
+    for w in sorted((run_dir / "workers").glob("*.json")):
+        wk = read_json(w)
+        if not isinstance(wk, dict) or "name" not in wk or "slice" not in wk:
+            continue  # not a worker record (e.g. stray config files)
+        if status is None or wk.get("status") == status:
+            yield w, wk
+
+
+def caffeinate_pid():
+    """pid of the caffeinate orchestra started, if it is still running."""
+    try:
+        pid = int(CAFF_PID.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return pid if re.search(r"\bcaffeinate -is\s*$", cmd) else None
+
+
+def caffeinate_hold():
+    """Keep the Mac awake while any run is active (idempotent across runs)."""
+    if caffeinate_pid():
+        return
+    try:
+        p = subprocess.Popen(["caffeinate", "-is"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except FileNotFoundError:
+        return
+    CAFF_PID.parent.mkdir(parents=True, exist_ok=True)
+    CAFF_PID.write_text(str(p.pid))
+
+
+def caffeinate_release():
+    pid = caffeinate_pid()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            pass
+    CAFF_PID.unlink(missing_ok=True)
+    return bool(pid)
+
+
+def file_lock_dir(slug, rel):
+    return LOCKS / slug / "files" / hashlib.sha1(rel.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- coordinator commands
+def cmd_new_run(a):
+    root = repo_root(a.repo)
+    slug = re.sub(r"[^a-z0-9]+", "-", a.title.lower()).strip("-")[:24] or "run"
+    run_id = f"{time.strftime('%m%d-%H%M')}-{slug}"
+    d = RUNS / run_id
+    if d.exists():
+        sys.exit(f"orch: run {run_id} exists")
+    git(root, "fetch", "--quiet", "origin")
+    b = default_branch(root)
+    excl = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info" / "exclude"
+    excl.parent.mkdir(parents=True, exist_ok=True)
+    if ".claude/worktrees/" not in (excl.read_text() if excl.exists() else ""):
+        with open(excl, "a") as f:  # keep worker worktrees out of `git add .` without touching tracked files
+            f.write("\n.claude/worktrees/\n")
+    write_json(d / "run.json", {
+        "id": run_id, "title": a.title, "repo": root, "repo_slug": slug_of(root),
+        "default_branch": b, "target": b, "base_sha": git(root, "rev-parse", f"origin/{b}"),
+        "coordinator": a.coordinator or cmux_workspace(),
+        "coordinator_workspace": a.coordinator_workspace or cmux_identify().get("workspace_ref"),
+        "status": "active", "created": now()})
+    for sub in ("slices", "artifacts", "workers"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    caffeinate_hold()
+    print(run_id)
+
+
+def cmd_run_branch(a):
+    """Multi-slice runs: create origin/orch/<run> at origin/<default>; workers push there."""
+    p = RUNS / a.run / "run.json"
+    r = read_json(p) or sys.exit(f"orch: no run {a.run}")
+    br = f"orch/{a.run}"
+    git(r["repo"], "fetch", "--quiet", "origin")
+    git(r["repo"], "push", "--quiet", "origin", f"origin/{r['default_branch']}:refs/heads/{br}")
+    git(r["repo"], "fetch", "--quiet", "origin")
+    r["target"] = br
+    write_json(p, r)
+    print(br)
+
+
+def cmd_baseline(a):
+    """Run every gate twice on a clean detached checkout of origin/<branch>; flag flaky gates."""
+    r = read_json(RUNS / a.run / "run.json") or sys.exit(f"orch: no run {a.run}")
+    root = r["repo"]
+    git(root, "fetch", "--quiet", "origin")
+    ref = f"origin/{a.branch or r['default_branch']}"
+    tmp = Path(tempfile.mkdtemp(prefix=f"orch-baseline-{a.run}-"))
+    wt = tmp / "wt"
+    git(root, "worktree", "add", "--detach", str(wt), ref)
+    try:
+        if a.setup:
+            subprocess.run(["bash", "-lc", a.setup], cwd=wt, capture_output=True, text=True)
+        results = []
+        for cmd in a.cmd:
+            runs_ = []
+            for i in range(2):
+                p = subprocess.run(["bash", "-lc", cmd], cwd=wt, capture_output=True, text=True)
+                log = RUNS / a.run / "artifacts" / "baseline" / f"{hashlib.sha1(cmd.encode()).hexdigest()[:8]}-{i}.log"
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text(p.stdout + p.stderr)
+                runs_.append({"exit": p.returncode, "log": str(log)})
+            results.append({"cmd": cmd, "runs": runs_, "flaky": runs_[0]["exit"] != runs_[1]["exit"]})
+        data = {"ref": ref, "sha": git(wt, "rev-parse", "HEAD"), "at": now(), "results": results}
+        write_json(RUNS / a.run / "baseline.json", data)
+        for x in results:
+            print(f"{'FLAKY' if x['flaky'] else ('ok   ' if x['runs'][0]['exit'] == 0 else 'FAIL ')}  {x['cmd']}  (logs: {x['runs'][0]['log']})")
+    finally:
+        git(root, "worktree", "remove", "--force", str(wt), check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_add_worker(a):
+    d = RUNS / a.run
+    r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
+    write_json(d / "workers" / f"{a.slice}.json", {
+        "run": a.run, "slice": a.slice, "name": f"{a.run}-{a.slice}", "workspace": a.workspace,
+        "target": r["target"], "status": "active", "started": now()})
+    print(f"{a.run}-{a.slice} → pushes to {r['target']}")
+
+
+def cmd_lock(a):
+    slug, taken = slug_of(a.repo), []
+    for rel in a.files:
+        d = file_lock_dir(slug, rel)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            d.mkdir()
+            write_json(d / "owner.json", {"owner": a.owner, "file": rel, "at": now()})
+            taken.append(d)
+        except FileExistsError:
+            holder = (read_json(d / "owner.json") or {}).get("owner", "?")
+            if holder == a.owner:
+                continue
+            for t in taken:  # all-or-nothing
+                shutil.rmtree(t, ignore_errors=True)
+            sys.exit(f"LOCKED {rel} by {holder}")
+    print(f"locked {len(a.files)} file(s) for {a.owner}")
+
+
+def unlock(repo, owner, files=()):
+    base, n = LOCKS / slug_of(repo) / "files", 0
+    for d in base.glob("*"):
+        o = read_json(d / "owner.json") or {}
+        if o.get("owner") == owner and (not files or o.get("file") in files):
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+    return n
+
+
+def cmd_unlock(a):
+    print(f"released {unlock(a.repo, a.owner, a.files)} lock(s)")
+
+
+def cmd_locks(a):
+    slug = slug_of(a.repo)
+    for d in sorted((LOCKS / slug / "files").glob("*")):
+        o = read_json(d / "owner.json") or {}
+        print(f"{o.get('owner', '?'):40} {o.get('file', '?')}")
+    m = read_json(LOCKS / slug / "merge" / "owner.json")
+    if m:
+        print(f"MERGE LOCK: {m.get('owner')} since {int(time.time() - m.get('at', 0))}s ago")
+
+
+def cmd_criteria_init(a):
+    """criteria file: JSON list of {id, text, check} — written by the coordinator from the spec."""
+    items = json.loads(Path(a.file).read_text())
+    for c in items:
+        if not {"id", "text"} <= set(c):
+            sys.exit("orch: each criterion needs id and text")
+        c.setdefault("check", "")
+        c.update(status="pending", sha=None, evidence="")
+    write_json(RUNS / a.run / "criteria.json", items)
+    print(f"{len(items)} criteria registered")
+
+
+def cmd_criteria_add(a):
+    """Append criteria (JSON list of {id, text, check}) without resetting the ones already recorded."""
+    p = RUNS / a.run / "criteria.json"
+    items = read_json(p, [])
+    have = {c["id"] for c in items}
+    new = json.loads(Path(a.file).read_text())
+    for c in new:
+        if not {"id", "text"} <= set(c):
+            sys.exit("orch: each criterion needs id and text")
+        if c["id"] in have:
+            sys.exit(f"orch: {c['id']} already exists (criteria-add never overwrites)")
+        c.setdefault("check", "")
+        c.update(status="pending", sha=None, evidence="")
+    write_json(p, items + new)
+    print(f"added {len(new)} criteria ({len(items) + len(new)} total)")
+
+
+def cmd_ports(a):
+    """Port block for a coordinator-run job (e.g. integration reviewer/verifier) so reap treats it as owned."""
+    if not (RUNS / a.run / "run.json").exists():
+        sys.exit(f"orch: no run {a.run}")
+    owner = f"{a.run}-{a.name}"
+    if a.release:
+        print(f"released {release_ports(owner)} block(s) for {owner}")
+        return
+    base = alloc_ports(owner)
+    print(f"{base} {base + PORT_BLOCK - 1}")
+
+
+def cmd_criteria_check(a):
+    items = read_json(RUNS / a.run / "criteria.json") or sys.exit("orch: no criteria.json")
+    bad = [c for c in items if c["status"] != "pass" or (a.sha and c.get("sha") != a.sha)]
+    for c in items:
+        ok = c["status"] == "pass" and (not a.sha or c.get("sha") == a.sha)
+        print(f"{'PASS' if ok else c['status'].upper():8} {c['id']}  {c['text'][:70]}  {(c.get('sha') or '')[:10]}")
+    if bad:
+        sys.exit(f"orch: {len(bad)} criterion(s) not passing{' at ' + a.sha[:10] if a.sha else ''}")
+
+
+def cmd_doctor(a):
+    live = cmux_live_workspaces()
+    slugs = set()
+    for run_dir in sorted(RUNS.glob("*")):
+        r = read_json(run_dir / "run.json") or {}
+        if r.get("status") != "active" or (a.run and r["id"] != a.run):
+            continue
+        slugs.add(r["repo_slug"])
+        print(f"{r['id']}  coord={r.get('coordinator')}  target={r.get('target')}")
+        for w, wk in workers_of(run_dir):
+            alive = live is None or wk.get("workspace") in live
+            prog = run_dir / "slices" / f"{wk['slice']}.progress.md"
+            age = int(time.time() - prog.stat().st_mtime) if prog.exists() else None
+            print(f"   {wk['slice']:18} {'alive' if alive else 'DEAD '}  progress {'never' if age is None else f'{age // 60}m ago'}")
+            if not alive and a.fix:
+                wk.update(status="dead", died=now())
+                write_json(w, wk)
+                print(f"      → marked dead. Respawn (resumes from its progress file): "
+                      f"orch spawn --run {r['id']} --slice {wk['slice']} --resume")
+    active_owners = {wk["name"] for s in slugs for d, _ in runs_for(s) for _, wk in workers_of(d)}
+    all_active = {wk["name"] for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"
+                  for _, wk in workers_of(d)}
+    for x in (LOCKS / "resources").glob("*"):
+        o = (read_json(x / "owner.json") or {}).get("owner", "")
+        base = re.sub(r"-(verify|integrate)$", "", o)
+        if base not in all_active and not o.endswith("-integrate"):
+            print(f"   orphan {x.name} lock by {o}" + (" → released" if a.fix else ""))
+            if a.fix:
+                shutil.rmtree(x, ignore_errors=True)
+    for x in (LOCKS / "ports").glob("*"):
+        o = (read_json(x / "owner.json") or {}).get("owner")
+        if o not in all_active:
+            print(f"   orphan port block {x.name} by {o}" + (" → released" if a.fix else ""))
+            if a.fix:
+                shutil.rmtree(x, ignore_errors=True)
+    for s in slugs:
+        m = LOCKS / s / "merge"
+        o = read_json(m / "owner.json")
+        if o and o.get("owner") not in active_owners and not o.get("owner", "").endswith("-integrate"):
+            print(f"   orphan MERGE LOCK held by {o.get('owner')}" + (" → released" if a.fix else ""))
+            if a.fix:
+                shutil.rmtree(m, ignore_errors=True)
+        for d in (LOCKS / s / "files").glob("*"):
+            fo = read_json(d / "owner.json") or {}
+            if fo.get("owner") not in active_owners:
+                print(f"   orphan file lock {fo.get('file')} by {fo.get('owner')}" + (" → released" if a.fix else ""))
+                if a.fix:
+                    shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_finish_worker(a):
+    w = RUNS / a.run / "workers" / f"{a.slice}.json"
+    wk = read_json(w) or sys.exit(f"orch: no worker {a.slice} in {a.run}")
+    if wk.get("status") == "active":
+        wk["status"] = a.status
+    wk["finished"] = now()
+    write_json(w, wk)
+    r = read_json(RUNS / a.run / "run.json")
+    print(f"released {unlock(r['repo'], wk['name'])} file lock(s), {release_ports(wk['name'])} port block(s)")
+
+
+def cmd_spawn(a):
+    """Open a worker in its own workspace inside the coordinator's sidebar group (the group is created,
+    anchored on the coordinator's workspace, if it has none). Allocates the worker's own port block."""
+    d = RUNS / a.run
+    r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
+    brief = d / "slices" / f"{a.slice}.md"
+    if not brief.exists():
+        sys.exit(f"orch: no brief {brief}")
+    name, root = f"{a.run}-{a.slice}", r["repo"]
+    trusted = ((read_json(Path.home() / ".claude.json", {}) or {}).get("projects", {}).get(root, {}) or {}).get("hasTrustDialogAccepted")
+    if not trusted and not os.environ.get("ORCH_SKIP_TRUST"):
+        add_need(d, f"Trust this folder: in a terminal run `cd {root} && claude`, accept the trust prompt, then /exit")
+        sys.exit(f"orch: {root} is not trusted yet — `claude -w` would hang. Added to NEEDS YOU; spawn again once trusted.")
+    wt = f"{root}/.claude/worktrees/{name}"
+    port = alloc_ports(name)
+    env = f"ORCH_PORT={port} ORCH_PORT_END={port + PORT_BLOCK - 1}"
+    worker = f"/worker {brief}"
+    # Workers load only the MCP servers they use (playwright, context7; cmux adds cmux-cua itself):
+    # the full set costs ~1.5GB per worker. The coordinator keeps everything (console tools, real Chrome).
+    # Workers load only the MCP servers they use (worker-mcp.json: playwright, context7) — the full set costs
+    # ~1GB more per worker. Native slices launch normally so cmux injects its Computer Use server (cmux only
+    # does that, and only hands over its socket token, when no --strict-mcp-config is given).
+    m = re.search(r"^[\s>*`-]*MODEL:[\s*`]*([A-Za-z][\w.\[\]-]*)", brief.read_text(), re.M)  # brief `MODEL: sonnet` overrides
+    model = f"--model {shlex.quote(m.group(1) if m else 'opus')} "
+    lean = ""
+    if (HOME / "worker-mcp.json").exists() and not (a.all_mcp or a.native):
+        lean = f"--strict-mcp-config --mcp-config {shlex.quote(str(HOME / 'worker-mcp.json'))} "
+    if a.resume:
+        if not Path(wt).exists():
+            sys.exit(f"orch: --resume but no worktree at {wt}")
+        cmdline = f"cd {shlex.quote(wt)} && {env} claude {lean}{model}-n {name} --permission-mode auto {shlex.quote(worker)}"
+    else:
+        cmdline = f"cd {shlex.quote(root)} && {env} claude {lean}{model}-w {name} -n {name} --permission-mode auto {shlex.quote(worker)}"
+    # Each worker gets its own workspace in the coordinator's sidebar group (created on first spawn).
+    ws = r.get("coordinator_workspace")
+    group = cmux_group_for(ws, a.run, f"{Path(root).name} · {r.get('title', a.run)}") if ws else None
+    args = ["cmux", "new-workspace", "--name", name, "--cwd", root, "--command", cmdline, "--focus", "false"]
+    if group:
+        args += ["--group", group, "--group-placement", "end"]
+    out = run(args)
+    wm = re.search(r"workspace:\d+", out)
+    surface = cmux_first_surface(wm.group(0)) if wm else None
+    if not surface:
+        release_ports(name)
+        sys.exit(f"orch: could not read the new workspace's surface from: {out}")
+    write_json(d / "workers" / f"{a.slice}.json", {
+        "run": a.run, "slice": a.slice, "name": name, "workspace": surface, "ws_ref": wm.group(0), "target": r["target"],
+        "ports": [port, port + PORT_BLOCK - 1], "lean_mcp": bool(lean), "status": "active", "started": now()})
+    msg = open_dash(a.run)
+    if msg:
+        print(msg)
+    print(f"{name} → workspace {wm.group(0)} ({surface}) in {group or 'no group'}, ports {port}-{port + PORT_BLOCK - 1}, pushes to {r['target']}")
+
+
+# ---------------------------------------------------------------- cleanup (nothing finished keeps running)
+ORCH_PORT_RANGE = (PORT_BASE, PORT_MAX + PORT_BLOCK - 1)
+
+
+def _ps():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,command="], capture_output=True, text=True).stdout
+    rows = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+    return rows
+
+
+def _cwds():
+    out = subprocess.run(["lsof", "-d", "cwd", "-Fpn"], capture_output=True, text=True).stdout
+    m, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            m[pid] = line[1:]
+    return m
+
+
+def _listeners(lo, hi):
+    """{pid: [ports]} for TCP listeners in [lo, hi]."""
+    out = subprocess.run(["lsof", "-nP", f"-iTCP:{lo}-{hi}", "-sTCP:LISTEN", "-Fpn"], capture_output=True, text=True).stdout
+    m, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            mm = re.search(r":(\d+)$", line)
+            if mm:
+                m.setdefault(pid, []).append(int(mm.group(1)))
+    return m
+
+
+def _protected(ps):
+    """This process and its ancestors (e.g. the coordinator's claude) are never killed."""
+    keep, pid = set(), os.getpid()
+    while pid and pid not in keep:
+        keep.add(pid)
+        pid = ps.get(pid, (0,))[0]
+    return keep
+
+
+def sweep(pids=(), ports=None, paths=(), dry=False):
+    """Kill pids + listeners on ports + anything running in/for paths, with their descendants.
+    Returns (killed pids, freed RSS in MB)."""
+    ps = _ps()
+    targets = set(pids)
+    if ports:
+        targets |= set(_listeners(*ports))
+    if paths:
+        for pid, cwd in _cwds().items():
+            if any(cwd == p or cwd.startswith(p + "/") for p in paths):
+                targets.add(pid)
+        for pid, (_, _, cmd) in ps.items():
+            if any(p in cmd for p in paths):
+                targets.add(pid)
+    kids = {}
+    for pid, (ppid, _, _) in ps.items():
+        kids.setdefault(ppid, []).append(pid)
+    stack = list(targets)
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            if c not in targets:
+                targets.add(c)
+                stack.append(c)
+    targets = {t for t in targets if t in ps} - _protected(ps)
+    mb = sum(ps[t][1] for t in targets) / 1024
+    if targets and not dry:
+        for t in targets:
+            try:
+                os.kill(t, 15)
+            except ProcessLookupError:
+                pass
+        for _ in range(6):
+            time.sleep(0.5)
+            alive = [t for t in targets if subprocess.run(["kill", "-0", str(t)], capture_output=True).returncode == 0]
+            if not alive:
+                break
+        for t in alive if targets else []:
+            try:
+                os.kill(t, 9)
+            except ProcessLookupError:
+                pass
+    return targets, mb
+
+
+def cleanup_worker(r, wk, full=True, dry=False):
+    """full: close pane, kill its processes, remove worktree/branch/derived data, release locks+ports.
+    not full (dead worker): kill leftover processes only, keep the worktree so it can resume."""
+    name, root = wk["name"], r["repo"]
+    wt = f"{root}/.claude/worktrees/{name}"
+    live = cmux_live_workspaces()
+    did = []
+    ports = tuple(wk["ports"]) if wk.get("ports") else None
+    if ports:  # a finished worker's block may since have been handed to a new worker: never sweep someone else's ports
+        holder = (read_json(LOCKS / "ports" / str(ports[0]) / "owner.json") or {}).get("owner")
+        if holder and holder != name:
+            ports = None
+    _, before_mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=True)  # measure before the pane closes
+    if full and wk.get("workspace") and (live is None or wk["workspace"] in live):
+        did.append("pane")
+        if not dry:
+            if wk.get("ws_ref"):
+                args = ["cmux", "workspace", "close", "--workspace", wk["ws_ref"], "--force"]
+            else:  # older workers opened as panes in the coordinator's workspace
+                args = ["cmux", "close-surface", "--surface", wk["workspace"], "--force"]
+                if r.get("coordinator_workspace"):
+                    args += ["--workspace", r["coordinator_workspace"]]
+            subprocess.run(args, capture_output=True, text=True)
+            time.sleep(2)  # the live session locks the worktree until it exits
+    killed, mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=dry)
+    mb = max(mb, before_mb)
+    if killed or mb >= 1:
+        did.append(f"~{mb:.0f}MB of processes")
+    if full:
+        if Path(wt).exists():
+            did.append("worktree")
+            if not dry:
+                git(root, "worktree", "remove", "--force", "--force", wt, check=False)
+        if not dry:
+            git(root, "branch", "-D", f"worktree-{name}", check=False)
+            for x in Path("/tmp").glob(f"{name}*"):
+                shutil.rmtree(x, ignore_errors=True)
+            unlock(root, name)
+            release_ports(name)
+            for res in (LOCKS / "resources").glob("*"):
+                if (read_json(res / "owner.json") or {}).get("owner", "").startswith(name):
+                    shutil.rmtree(res, ignore_errors=True)
+    return did, mb
+
+
+def cmd_close(a):
+    """Close a worker's pane, kill everything it started, remove its worktree + branch, free its locks/ports."""
+    d = RUNS / a.run
+    r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
+    w = d / "workers" / f"{a.slice}.json"
+    wk = read_json(w) or sys.exit(f"orch: no worker {a.slice}")
+    did, mb = cleanup_worker(r, wk, full=not a.keep_worktree)
+    if wk.get("status") == "active":
+        wk["status"] = a.status or "done"
+    wk.update(finished=now(), cleaned=now())
+    write_json(w, wk)
+    print(f"closed {wk['name']}: {', '.join(did) or 'nothing left running'}")
+
+
+def sims_down(dry=False):
+    """Delete orch-sim clones of finished owners. Never `simctl shutdown all`: that kills other workers' clones
+    and the user's own simulators (and every test run's isolated ORCH_HOME looks like 'no active run')."""
+    sim = Path(__file__).resolve().parent / "orch-sim"
+    if not sim.exists():
+        return ""
+    p = subprocess.run([str(sim), "reap", *(["--dry-run"] if dry else [])], capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    return f"orch-sim reap{' --dry-run' if dry else ''}: {out}" if out else ""
+
+
+def any_active_run(except_run=None):
+    return any((read_json(d / "run.json") or {}).get("status") == "active" and d.name != except_run
+               for d in RUNS.glob("*"))
+
+
+def cmd_reap(a):
+    """Clean up anything finished/dead that is still using memory. Safe to run any time (the 30-min heartbeat does)."""
+    runs = [RUNS / a.run] if a.run else [d for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"]
+    live, total, lines = cmux_live_workspaces(), 0.0, []
+    for d in runs:
+        r = read_json(d / "run.json") or {}
+        for w, wk in workers_of(d, status=None):
+            if wk.get("status") == "active":
+                if live is not None and wk.get("workspace") not in live:
+                    if not a.dry_run:
+                        wk.update(status="dead", died=now())
+                        write_json(w, wk)
+                    did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run)
+                    lines.append(f"{wk['name']}: pane gone → marked dead; {', '.join(did) or 'no leftovers'} (worktree kept for --resume)")
+                    total += mb
+                continue
+            if wk.get("status") == "dead":
+                did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run)
+            else:
+                did, mb = cleanup_worker(r, wk, full=True, dry=a.dry_run)
+                if did and not a.dry_run:
+                    wk["cleaned"] = now()
+                    write_json(w, wk)
+            if did:
+                lines.append(f"{wk['name']} ({wk.get('status')}): {', '.join(did)}")
+                total += mb
+        if r.get("repo") and Path(r["repo"]).exists() and not a.dry_run:
+            git(r["repo"], "worktree", "prune", check=False)
+    # orphan listeners on orchestra ports whose block belongs to no active worker
+    active = {wk["name"] for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"
+              for _, wk in workers_of(d)}
+    active_runs = [d.name for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"]
+    owned = {int(x.name) for x in (LOCKS / "ports").glob("*")
+             if (lambda o: o in active or any(o.startswith(f"{rid}-") for rid in active_runs))(
+                 (read_json(x / "owner.json") or {}).get("owner", ""))}
+    orphans = [pid for pid, ports in _listeners(*ORCH_PORT_RANGE).items()
+               if all((p - PORT_BASE) // PORT_BLOCK * PORT_BLOCK + PORT_BASE not in owned for p in ports)]
+    if orphans:
+        killed, mb = sweep(pids=orphans, dry=a.dry_run)
+        lines.append(f"orphan servers on orchestra ports: {len(killed)} process(es) {mb:.0f}MB")
+        total += mb
+    if not any_active_run() and not a.dry_run and caffeinate_release():
+        lines.append("caffeinate released (no active runs)")
+    if not any_active_run() and not a.keep_sim:
+        msg = sims_down(dry=a.dry_run)
+        if msg:
+            lines.append(msg + " (no active runs)")
+    verb = "would free" if a.dry_run else "freed"
+    print("\n".join(lines) if lines else "nothing to clean")
+    if total:
+        print(f"{verb} ~{total:.0f}MB")
+
+
+def cmd_end_run(a):
+    p = RUNS / a.run / "run.json"
+    r = read_json(p) or sys.exit(f"orch: no run {a.run}")
+    if a.status == "done" and (RUNS / a.run / "criteria.json").exists():
+        # every criterion must have passed on a commit that is now part of origin/<default>
+        git(r["repo"], "fetch", "--quiet", "origin")
+        items = read_json(RUNS / a.run / "criteria.json")
+        bad = [c["id"] for c in items if c["status"] != "pass" or not c.get("sha") or subprocess.run(
+            ["git", "merge-base", "--is-ancestor", c["sha"], f"origin/{r['default_branch']}"],
+            cwd=r["repo"]).returncode != 0]
+        if bad:
+            sys.exit(f"orch: refusing to end run — not passing on shipped code: {', '.join(bad)} (orch criteria-check)")
+    # tear everything down: every worker (whatever its state), the integration worktree, its processes
+    total = 0.0
+    for w, wk in workers_of(RUNS / a.run, status=None):
+        did, mb = cleanup_worker(r, wk, full=True)
+        total += mb
+        if wk.get("status") == "active":
+            wk["status"] = a.status
+        wk["cleaned"] = now()
+        write_json(w, wk)
+        if did:
+            print(f"cleaned {wk['name']}: {', '.join(did)}")
+    integ = {"name": f"{a.run}-integrate", "ports": None}
+    did, mb = cleanup_worker(r, integ, full=True)
+    total += mb
+    if did:
+        print(f"cleaned {integ['name']}: {', '.join(did)}")
+    git(r["repo"], "branch", "-D", f"{a.run}-integrate", check=False)
+    git(r["repo"], "worktree", "prune", check=False)
+    if r.get("target", "").startswith("orch/"):
+        git(r["repo"], "push", "--quiet", "origin", f":refs/heads/{r['target']}", check=False)
+    if r.get("dash_ws"):
+        subprocess.run(["cmux", "workspace", "close", "--workspace", r["dash_ws"], "--force"], capture_output=True, text=True)
+    for x in (LOCKS / "ports").glob("*"):
+        if (read_json(x / "owner.json") or {}).get("owner", "").startswith(f"{a.run}-"):
+            shutil.rmtree(x, ignore_errors=True)
+    r.update(status=a.status, ended=now())
+    write_json(p, r)
+    if not any_active_run():
+        caffeinate_release()
+    if not a.keep_sim and not any_active_run():
+        msg = sims_down()
+        if msg:
+            print(msg + " (no other active runs)")
+    print(f"{a.run} {a.status}" + (f" — freed ~{total:.0f}MB" if total else ""))
+
+
+def cmd_status(a):
+    for run_dir in sorted(RUNS.glob("*")):
+        r = read_json(run_dir / "run.json") or {}
+        if (a.run and r.get("id") != a.run) or (not a.all and r.get("status") != "active"):
+            continue
+        print(f"{r.get('id')}  [{r.get('status')}]  {r.get('repo')}  target={r.get('target')}  coord={r.get('coordinator')}")
+        for _, wk in workers_of(run_dir, status=None):
+            print(f"   {wk.get('slice'):20} {wk.get('status'):8} {wk.get('workspace')}  {wk.get('sha', '')[:10]}")
+
+
+def cmd_broadcast(a):
+    """Coordinator → its own run's active workers (optionally only those pushing to --branch)."""
+    d = RUNS / a.run
+    if not (d / "run.json").exists():
+        sys.exit(f"orch: no run {a.run}")
+    sent, failed = [], []
+    for _, wk in workers_of(d):
+        if a.branch and wk.get("target") != a.branch:
+            continue
+        (sent if cmux_message(wk.get("workspace"), a.text, "coordinator") else failed).append(wk["name"])
+    print(f"sent to: {', '.join(sent) or '-'}" + (f"; UNDELIVERED: {', '.join(failed)}" if failed else ""))
+
+
+def cmd_report(a):
+    """Compact status table for the 30-minute heartbeat updates (deterministic, cheap)."""
+    d = RUNS / a.run
+    r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
+    live = cmux_live_workspaces()
+    crit = read_json(d / "criteria.json", [])
+    npass = sum(c["status"] == "pass" for c in crit)
+    print(f"{r['id']} [{r['status']}] → {r['target']}  criteria {npass}/{len(crit)} passing  ({time.strftime('%H:%M')})")
+    slices = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(".progress.md"))
+    workers = {wk["slice"]: wk for _, wk in workers_of(d, status=None)}
+    for sl in slices:
+        wk = workers.get(sl)
+        prog = d / "slices" / f"{sl}.progress.md"
+        last, age = "", None
+        if prog.exists():
+            lines = [x for x in prog.read_text().splitlines() if x.strip()]
+            last, age = (lines[-1] if lines else ""), int((time.time() - prog.stat().st_mtime) // 60)
+        if not wk:
+            state = "queued"
+        elif wk["status"] == "active" and live is not None and wk.get("workspace") not in live:
+            state = "DEAD"
+        else:
+            state = wk["status"]
+        stale = " STALLED" if state == "active" and age is not None and age >= a.stall else ""
+        print(f"  {sl:18} {state:7}{stale:8} {'' if age is None else f'{age}m ago':8} {last[:90]}")
+
+
+# ---------------------------------------------------------------- dashboard (live view for the user)
+def add_need(d, text):
+    """Add an item to NEEDS YOU (deduplicated by text)."""
+    needs = read_json(d / "waiting.json", [])
+    if not any(n["text"] == text for n in needs):
+        needs.append({"text": text, "since": time.strftime("%H:%M")})
+        write_json(d / "waiting.json", needs)
+    return needs
+
+
+def cmd_note(a):
+    """Coordinator-maintained dashboard inputs: slice plan, items needing the user, next tick, finish progress."""
+    d = RUNS / a.run
+    if not (d / "run.json").exists():
+        sys.exit(f"orch: no run {a.run}")
+    if a.plan:
+        write_json(d / "plan.json", read_json(Path(a.plan)) or sys.exit(f"orch: bad plan file {a.plan}"))
+    needs = add_need(d, a.wait) if a.wait else read_json(d / "waiting.json", [])
+    if a.done:
+        needs = [] if a.done == "all" else [w for i, w in enumerate(needs, 1) if str(i) != a.done]
+        write_json(d / "waiting.json", needs)
+    if a.next_tick:
+        hh, mm = map(int, a.next_tick.split(":"))
+        t = time.localtime()
+        nt = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
+        write_json(d / "ticks.json", {**read_json(d / "ticks.json", {}), "next": nt})
+    if a.finish is not None:
+        write_json(d / "finish.json", {"step": a.finish, "at": time.strftime("%H:%M")})
+    for i, w in enumerate(needs, 1):
+        print(f"  {i}. [{w['since']}] {w['text']}")
+
+
+WORKER_STEPS = [(1, "setup + sync"), (2, "implement (tests red → green)"), (3, "gates"), (4, "review + verify"),
+                (5, "fix loop (if review/verify fails)"), (6, "rebase + push to run branch")]
+FINISH_STEPS = ["integration worktree + rebase on main", "all checks + secrets scan",
+                "final review + adversarial + verify (all criteria)", "push to main", "end run + clean up"]
+
+
+def _dash_frame(run):
+    d = RUNS / run
+    r = read_json(d / "run.json") or {}
+    B, DIM, G, Y, R_, C, X = "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m"
+    W = min(shutil.get_terminal_size((100, 40)).columns, 140)
+    crit = read_json(d / "criteria.json", [])
+    npass = sum(c.get("status") == "pass" for c in crit)
+    bar = "█" * round(10 * npass / len(crit)) + "░" * (10 - round(10 * npass / len(crit))) if crit else ""
+    nxt = read_json(d / "ticks.json", {}).get("next")  # set once from CronCreate's "Next run"; fixed 30-min heartbeat
+    if nxt and nxt < time.time() - 60:
+        nxt += ((time.time() - nxt) // 1800 + 1) * 1800
+    secs = max(0, int(nxt - time.time())) if nxt else 0
+    tick = f"{time.strftime('%H:%M', time.localtime(nxt))} ({secs // 60}m{secs % 60:02d}s)" if nxt else "—"
+    status = r.get("status", "?")
+    if status != "active":
+        tick = "—"
+    tag = lambda who: f"{DIM}{who:>6}{X}"
+
+    live = cmux_live_workspaces()
+    workers = {wk["slice"]: wk for _, wk in workers_of(d, status=None) if wk["slice"] != "integrate"}
+    plan = read_json(d / "plan.json", [])
+    meta = {x["id"]: x for x in plan}
+    briefed = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(".progress.md"))
+    order = list(dict.fromkeys([x["id"] for x in plan] + briefed + list(workers)))
+    merged = {sl for sl, wk in workers.items() if wk["status"] in ("done", "merged")}
+    fin = read_json(d / "finish.json", {}).get("step", 0)  # 0 = not started, 1..5 = current step, 6 = finished
+    if status != "active":
+        fin = 6
+
+    needs = read_json(d / "waiting.json", [])
+    waiting, working, pending, done = [], [], [], []
+    for sl in order:
+        m, wk = meta.get(sl, {}), workers.get(sl)
+        name = f"{sl} {m.get('title', '')}".strip()
+        prog = d / "slices" / f"{sl}.progress.md"
+        lines = [x for x in prog.read_text().splitlines() if x.strip() and not x.startswith("#")] if prog.exists() else []
+        age = int((time.time() - prog.stat().st_mtime) // 60) if prog.exists() else None
+        if sl in merged:
+            sha = next((mm.group(1) for ln in reversed(lines) for mm in [re.search(r"\b([0-9a-f]{7,12})\b", ln)] if mm), "")
+            when = (lines[-1][:5] if lines else "")
+            done.append(f"  {G}✓{X} {name:24} {sha[:7]:8} {DIM}{when}{X}")
+            continue
+        step = max([int(mm.group(1)) for ln in lines for mm in [re.search(r"\bstep (\d+)", ln)] if mm] or [0])
+        active = bool(wk and wk["status"] == "active")
+        if active:
+            dead = live is not None and wk.get("workspace") not in live
+            stalled = age is not None and age >= 15
+            dot = f"{R_}✗ DEAD{X}" if dead else f"{Y}● STALLED{X}" if stalled else f"{G}●{X}"
+            label = dict(WORKER_STEPS).get(step, "starting")
+            working.append(f"  {dot} {name:22} step {step or '—'} {label} {DIM}· {'' if age is None else f'{age}m ago'}{X}"
+                           .ljust(W - 8) + tag("worker"))
+            for ln in lines[-2:]:
+                working.append(f"      {DIM}{ln[:W - 8]}{X}")
+            if step == 4:
+                waiting.append(f"  {name:22} review + verify  {DIM}← its reviewer + verifier{X}".ljust(W - 8) + tag("worker"))
+            for n, lab in WORKER_STEPS:
+                if n >= max(step, 1):
+                    pending.append((f"{sl}  {lab}", "worker", n == step))
+        else:
+            deps = [x for x in m.get("depends", []) if x not in merged]
+            if deps:
+                waiting.append(f"  {name:22} {DIM}← {', '.join(deps)} merged{X}".ljust(W - 8) + tag("worker"))
+            else:
+                waiting.append(f"  {name:22} {DIM}← dispatch (≤3 workers at once){X}".ljust(W - 8) + tag("coord"))
+            goal = f": {m['goal']}" if m.get("goal") else ""
+            pending.append((f"{sl}  {m.get('title', '')}{goal} — all 6 steps", "worker", False))
+    slices_left = [sl for sl in order if sl not in merged]
+    if fin < 6:
+        if fin == 0:
+            waiting.append(f"  {'run finish':22} {DIM}← {', '.join(slices_left) or 'coordinator'}{X}".ljust(W - 8) + tag("coord"))
+        else:
+            working.append(f"  {G}●{X} {'run finish':22} {FINISH_STEPS[fin - 1]}".ljust(W - 8) + tag("coord"))
+            if fin == 3:
+                waiting.append(f"  {'run finish':22} {DIM}← final reviewers + verifier{X}".ljust(W - 8) + tag("coord"))
+        for i, lab in enumerate(FINISH_STEPS, 1):
+            if i >= max(fin, 1):
+                pending.append((f"run {lab}", "coord", i == fin))
+    for i, lab in enumerate(FINISH_STEPS, 1):
+        if i < fin:
+            done.append(f"  {G}✓{X} run {lab}")
+
+    out = [f"{B}{Path(r.get('repo', '?')).name}{X} · {r.get('title', run)}  {DIM}{run} [{status}]{X}  "
+           f"{time.strftime('%H:%M:%S')}   next tick {C}{tick}{X}",
+           f"Criteria {npass}/{len(crit)} {G}{bar}{X}", ""]
+    out.append(f"{B}{Y}NEEDS YOU ({len(needs)}){X}" if needs else f"{B}NEEDS YOU{X} {DIM}nothing{X}")
+    out += [f"  {Y}!{X} {i}. {n['text'][:W - 20]} {DIM}since {n['since']}{X}" for i, n in enumerate(needs, 1)]
+    out += ["", f"{B}WAITING ({len(waiting)}){X}"] + (waiting or [f"  {DIM}nothing blocked{X}"])
+    out += ["", f"{B}WORKING ({sum(not w.startswith('      ') for w in working)}){X}"] + (working or [f"  {DIM}idle{X}"])
+    out += ["", f"{B}PENDING ({len(pending)}){X}"]
+    for i, (txt, who, now_) in enumerate(pending, 1):
+        line = f"  {i:2}. {txt[:W - 24]}"
+        out.append((f"{Y}{line}{X}" if now_ else line).ljust(W - 8 + (len(Y) + len(X) if now_ else 0)) + tag(who) +
+                   (f" {Y}● now{X}" if now_ else ""))
+    if not pending:
+        out.append(f"  {DIM}nothing left{X}")
+    out += ["", f"{B}DONE ({len(done)}){X}"] + (done or [f"  {DIM}nothing yet{X}"])
+    return "\n".join(out)
+
+
+def cmd_dash(a):
+    """Live terminal dashboard: redraws every --every seconds (Ctrl-C to quit)."""
+    if a.open:
+        print(open_dash(a.run) or "orch: dashboard already open")
+        return
+    if a.once:
+        print(_dash_frame(a.run))
+        return
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[2J" + _dash_frame(a.run) + "\n")
+            sys.stdout.flush()
+            time.sleep(a.every)
+    except KeyboardInterrupt:
+        pass
+
+
+def open_dash(run):
+    """Open the dashboard as its own workspace in the coordinator's group (once per run)."""
+    d = RUNS / run
+    r = read_json(d / "run.json") or sys.exit(f"orch: no run {run}")
+    live = cmux_live_workspaces() or set()
+    if r.get("dash_ws") and r["dash_ws"] in live:
+        return None
+    ws = r.get("coordinator_workspace")
+    group = cmux_group_for(ws, run, f"{Path(r['repo']).name} · {r.get('title', run)}") if ws else None
+    args = ["cmux", "new-workspace", "--name", f"{run} dashboard", "--cwd", r["repo"],
+            "--command", f"{shlex.quote(str(Path(__file__).resolve()))} dash --run {shlex.quote(run)}", "--focus", "false"]
+    if group:
+        args += ["--group", group, "--group-placement", "afterCurrent", "--group-reference", ws]
+    out = subprocess.run(args, capture_output=True, text=True).stdout
+    m = re.search(r"workspace:\d+", out)
+    if not m:
+        return f"orch: could not open dashboard: {out.strip()}"
+    r["dash_ws"] = m.group(0)
+    write_json(d / "run.json", r)
+    return f"dashboard → {m.group(0)}" + (f" in {group}" if group else "")
+
+
+# ---------------------------------------------------------------- worker commands
+def cmd_register(a):
+    wt = a.worktree
+    r = read_json(RUNS / a.run / "run.json") or sys.exit(f"orch: no run {a.run}")
+    target = a.target or r["target"]
+    git(wt, "fetch", "--quiet", "origin")
+    if a.sync:
+        # Point a FRESH worktree at origin/<target>. Refuses if it has edits or commits of its own.
+        if git(wt, "status", "--porcelain", "--untracked-files=no"):  # untracked junk (e.g. firebase-debug.log) is harmless
+            sys.exit("orch: --sync refused: worktree has uncommitted changes")
+        own = git(wt, "rev-list", "HEAD", "--not", f"origin/{target}", f"origin/{r['default_branch']}")
+        if own:
+            sys.exit(f"orch: --sync refused: worktree has {len(own.split())} commit(s) of its own (resume instead)")
+        git(wt, "reset", "--quiet", "--hard", f"origin/{target}")
+    write_json(git_dir(wt) / "orchestra-owner.json", {
+        "owner": f"{a.run}-{a.slice}", "run": a.run, "slice": a.slice, "target": target,
+        "risky": a.risky, "workspace": cmux_workspace(), "at": now()})
+    print(f"registered {a.run}-{a.slice} → pushes to {target}{' (risky: adversarial review required)' if a.risky else ''}")
+
+
+# same file listing as push-guard's touched(): unquoted paths, merge-carried changes included
+LOG_FILES = ("-c", "core.quotepath=off", "log", "--diff-merges=combined", "--no-renames", "--name-only", "--format=")
+
+
+def tier_shipped(repo, t):
+    """Same rule as push-guard's shipped(): ancestor of the target, or a target commit holds the change's content for
+    every file it touched (squash-merged PR)."""
+    ok = lambda *args: subprocess.run(["git", "--literal-pathspecs", *args], cwd=repo, capture_output=True).returncode == 0
+    if ok("merge-base", "--is-ancestor", t["sha"], t["target"]):
+        return True
+    files = t.get("files", [])
+    cs = git(repo, "--literal-pathspecs", "rev-list", "--max-count=500", t["target"], "--not", t["sha"], "--", *files,
+             check=False).splitlines() if files else []
+    return any(ok("diff", "--quiet", t["sha"], c, "--", *files) for c in cs)
+
+
+def tier_bound_ref(repo, t):
+    """First of HEAD / local branches push-guard would still bind to the record: it contains the change, or its
+    unpushed commits touch the change's files (an amended/rebased/cherry-picked copy). None when nothing is bound."""
+    files = set(t.get("files", []))
+    for ref in ["HEAD", *git(repo, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines()]:
+        if subprocess.run(["git", "merge-base", "--is-ancestor", t["sha"], ref], cwd=repo).returncode == 0:
+            return ref
+        if files & set(git(repo, *LOG_FILES, ref, "--not", "--remotes").splitlines()):
+            return ref
+    return None
+
+
+def cmd_tier(a):
+    """Record the task tier for HEAD (one record per repo). Tier S ships from a main checkout: push-guard then wants
+    gates + a reviewer PASS on the pushed commit, and binds the tier to the files the S change touches. M/L recorded
+    on a committed change makes push-guard deny shipping it from a main checkout (it goes through a worker)."""
+    p = Path(git(a.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "orchestra-tier.json"
+    if a.clear == bool(a.set):
+        sys.exit("orch: tier needs exactly one of --set S|M|L or --clear")
+    if a.clear:
+        old = read_json(p, {})
+        held = old and not tier_shipped(a.repo, old) and tier_bound_ref(a.repo, old)
+        if held:
+            sys.exit(f"orch: {held} still carries the tier-{old['tier']} change {old['sha'][:10]} or a copy of it "
+                     f"(unpushed commits touching {', '.join(old.get('files', [])[:3])}) — ship it, or reset/delete "
+                     f"that branch, then orch tier --clear")
+        p.unlink(missing_ok=True)
+        return print("tier record cleared")
+    if a.set == "S" and git(a.repo, "branch", "-r", "--contains", "HEAD"):
+        sys.exit("orch: HEAD is already on a remote — commit the S change first, then orch tier --set S")
+    sha, target = head(a.repo), f"origin/{default_branch(a.repo)}"
+    files = set(git(a.repo, *LOG_FILES, "HEAD", "--not", target).splitlines())  # paths may hold spaces
+    old = read_json(p, {})
+    anc = lambda x, y: subprocess.run(["git", "merge-base", "--is-ancestor", x, y], cwd=a.repo).returncode == 0
+    if (old.get("tier") == "S" and not a.replace and not tier_shipped(a.repo, old) and not anc(old["sha"], sha)
+            and not files & set(old.get("files", []))):
+        sys.exit(f"orch: tier S for {old['sha'][:10]} ({', '.join(old.get('files', [])[:3])}) hasn't shipped and this "
+                 f"change is unrelated — ship it first, or pass --replace to drop it")
+    write_json(p, {"tier": a.set, "sha": sha, "target": target, "files": sorted(files), "at": now()})
+    print(f"tier {a.set} recorded for {sha[:10]} ({len(files)} file(s))")
+
+
+ERROR_LINE = re.compile(r"\berror\b|\bERR!|\bfail(ed|ure|ing)?\b|exception|traceback|panic:|✗|✘", re.I)
+NOT_ERROR = re.compile(r"\b0 (errors?|failed|failures?)\b", re.I)
+
+
+def first_error(out):
+    """The first error-looking line of a gate's output, else its last 5 lines."""
+    lines = out.strip().splitlines()
+    hit = next((x for x in lines if ERROR_LINE.search(x) and not NOT_ERROR.search(x)), None)
+    return [hit] if hit else lines[-5:]
+
+
+HYGIENE_FILES = ((".env", lambda f: Path(f).name.startswith(".env") and Path(f).name != ".env.example"),
+                 ("node_modules", lambda f: "node_modules" in Path(f).parts),
+                 (".pem", lambda f: f.endswith(".pem")),
+                 (".DS_Store", lambda f: Path(f).name == ".DS_Store"))
+HYGIENE_LINES = (("debugger", re.compile(r"\bdebugger\b")), ("console.log", re.compile(r"\bconsole\.log\s*\(")))
+JS_FILES = ("*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts", "*.vue", "*.svelte", "*.html")
+
+
+def hygiene(wt, target):
+    """Named reasons the change (commits + staged, vs origin/<target>) adds what never belongs in a commit.
+    A repo CLAUDE.md line `orch-allow: console.log, .DS_Store` opts out of those names."""
+    base = git(wt, "merge-base", f"origin/{target}", "HEAD", check=False)
+    if not base:
+        return []
+    md = git(wt, "show", "HEAD:CLAUDE.md", check=False)  # committed text only, so the reviewer saw the opt-out
+    allow = set(re.findall(r"[^\s,]+", " ".join(re.findall(r"^\s*orch-allow:(.*)$", md, re.M))))
+    added = git(wt, "-c", "core.quotepath=off", "diff", "--cached", "--name-only", "--diff-filter=ACR", base).splitlines()
+    bad = []
+    for name, hit in HYGIENE_FILES:
+        files = [f for f in added if hit(f)]
+        if files and name not in allow:
+            bad.append(f"adds {name}: {', '.join(files[:3])}")
+    diff = git(wt, "diff", "--cached", "-U0", base, "--", *JS_FILES)
+    lines = [x[1:] for x in diff.splitlines() if x.startswith("+") and not x.startswith("+++")]
+    for name, rx in HYGIENE_LINES:
+        n = sum(bool(rx.search(x)) for x in lines)
+        if n and name not in allow:
+            bad.append(f"adds {n} {name} line(s) in js/ts/vue/svelte/html")
+    return bad
+
+
+def cmd_gates(a):
+    wt = a.worktree
+    o = owner_info(wt) or {}  # unregistered = tier S in a main checkout; evidence still lands in its git dir
+    target = o.get("target") or default_branch(wt)
+    sha, results = head(wt), []
+    logs = git_dir(wt) / "orchestra-artifacts" / "gates"
+    logs.mkdir(parents=True, exist_ok=True)
+    for cmd in a.cmd:
+        t = time.time()
+        p = subprocess.run(["bash", "-lc", cmd], cwd=wt, capture_output=True, text=True)
+        log = logs / f"{sha[:10]}-{hashlib.sha1(cmd.encode()).hexdigest()[:8]}.log"
+        log.write_text(p.stdout + p.stderr)
+        results.append({"cmd": cmd, "exit": p.returncode, "secs": round(time.time() - t), "log": str(log)})
+        print(f"{'ok  ' if p.returncode == 0 else 'FAIL'} {cmd}  ({results[-1]['secs']}s)  {log}")
+        for line in first_error(p.stdout + p.stderr) if p.returncode else []:
+            print(f"      {line[:160]}")
+    bad = hygiene(wt, target)
+    if bad:
+        results.append({"cmd": "hygiene", "exit": 1, "secs": 0, "log": "", "reasons": bad})
+        print(f"FAIL hygiene: {'; '.join(bad)}  (opt out: repo CLAUDE.md `orch-allow: <name>`)")
+    write_json(git_dir(wt) / "orchestra-gates-run.json", {"sha": sha, "at": now(), "results": results})
+    if any(x["exit"] for x in results):
+        sys.exit(1)
+
+
+def cmd_verdict(a):
+    wt, o = a.worktree, owner_info(a.worktree) or {}  # unregistered = tier S lite review in a main checkout
+    if git(wt, "status", "--porcelain", "--untracked-files=no"):
+        sys.exit("orch: uncommitted changes — a verdict must be about a commit")
+    p = git_dir(wt) / "orchestra-verdicts.json"
+    v = read_json(p, [])
+    v.append({"role": a.role, "verdict": a.verdict, "sha": head(wt),
+              "patch_id": patch_id(wt, o.get("target") or default_branch(wt)),
+              "mode": a.mode, "summary": a.summary, "at": now()})
+    write_json(p, v)
+    print(f"{a.role} {a.verdict} recorded for {head(wt)[:10]}")
+
+
+def cmd_criterion(a):
+    p = RUNS / a.run / "criteria.json"
+    items = read_json(p) or sys.exit("orch: no criteria.json for this run")
+    for c in items:
+        if c["id"] == a.id:
+            c.update(status=a.status, sha=a.sha, evidence=a.evidence, at=now())
+            write_json(p, items)
+            print(f"{a.id} {a.status} @ {a.sha[:10]}")
+            return
+    sys.exit(f"orch: no criterion {a.id}")
+
+
+def cmd_gates_ok(a):
+    wt, o = a.worktree, owner_info(a.worktree) or sys.exit("orch: worktree not registered")
+    if git(wt, "status", "--porcelain", "--untracked-files=no"):
+        sys.exit("orch: uncommitted changes — commit first so the recorded HEAD is what gets pushed")
+    sha, pid, problems = head(wt), patch_id(wt, o["target"]), []
+    gr = read_json(git_dir(wt) / "orchestra-gates-run.json") or {}
+    if gr.get("sha") != sha:
+        problems.append("gates were not run on this HEAD (orch gates --cmd ...)")
+    elif any(x["exit"] for x in gr["results"]) and not a.accept_failures:
+        problems.append("a gate failed; fix it, or pass --accept-failures '<why it matches the baseline>'")
+    verdicts = read_json(git_dir(wt) / "orchestra-verdicts.json", [])
+
+    def latest(role):
+        vs = [v for v in verdicts if v["role"] == role]
+        return vs[-1] if vs else None
+    roles = PASS_ROLES + (("adversarial",) if o.get("risky") else ())
+    for role in roles:
+        v = latest(role)
+        if not v or v["verdict"] != "PASS":
+            problems.append(f"no PASS from {role} (latest: {v['verdict'] if v else 'none'})")
+        elif v["sha"] != sha and not (role != "verifier" and pid and v.get("patch_id") == pid):
+            # reviewer verdicts survive a clean rebase (identical patch); the verifier must re-run on HEAD
+            problems.append(f"{role} PASS is for {v['sha'][:10]}, not HEAD {sha[:10]}"
+                            + ("" if role == "verifier" else " and the patch changed during rebase"))
+    if problems:
+        sys.exit("orch: gates-ok refused:\n  - " + "\n  - ".join(problems))
+    write_json(git_dir(wt) / "orchestra-gates.json", {
+        "sha": sha, "owner": o["owner"], "target": o["target"], "at": now(),
+        "accepted_failures": a.accept_failures or "", "evidence": a.evidence})
+    print(f"gates-ok recorded for {sha[:10]} → may push to {o['target']}")
+
+
+def merge_dir(path):
+    return LOCKS / slug_of(path) / "merge"
+
+
+def cmd_merge_lock(a):
+    d, deadline = merge_dir(a.repo), time.time() + a.wait
+    d.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            d.mkdir()
+            write_json(d / "owner.json", {"owner": a.owner, "workspace": cmux_workspace(), "at": time.time()})
+            print(f"merge lock held by {a.owner} — rebase, push, unlock; re-verify OUTSIDE the lock")
+            return
+        except FileExistsError:
+            o = read_json(d / "owner.json") or {}
+            if o.get("owner") == a.owner:
+                print("already held")
+                return
+            live = cmux_live_workspaces()
+            dead = live is not None and o.get("workspace") and o["workspace"] not in live
+            if dead or time.time() - o.get("at", 0) > MERGE_LOCK_MAX_SECS:
+                print(f"stealing stale merge lock from {o.get('owner')} ({'holder gone' if dead else 'expired'})")
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            if time.time() > deadline:
+                sys.exit(f"BUSY merge lock held by {o.get('owner')}")
+            time.sleep(5)
+
+
+RESOURCES = ("sim", "chrome")  # shared, one-at-a-time things: the iOS Simulator, the user's real Chrome
+RESOURCE_MAX_SECS = 30 * 60
+
+
+def cmd_resource_lock(a):
+    """Take a shared resource (sim / chrome); waits. Stale if the holder's pane is gone or >30 min."""
+    d, deadline = LOCKS / "resources" / a.name, time.time() + a.wait
+    d.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            d.mkdir()
+            write_json(d / "owner.json", {"owner": a.owner, "surface": cmux_workspace(), "at": time.time()})
+            print(f"{a.name} held by {a.owner} — release with: orch resource-unlock --name {a.name} --owner {a.owner}")
+            return
+        except FileExistsError:
+            o = read_json(d / "owner.json") or {}
+            if o.get("owner") == a.owner:
+                print("already held")
+                return
+            live = cmux_live_workspaces()
+            dead = live is not None and o.get("surface") and o["surface"] not in live
+            if dead or time.time() - o.get("at", 0) > RESOURCE_MAX_SECS:
+                print(f"taking stale {a.name} lock from {o.get('owner')} ({'holder gone' if dead else 'expired'})")
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            if time.time() > deadline:
+                sys.exit(f"BUSY {a.name} held by {o.get('owner')}")
+            time.sleep(5)
+
+
+def cmd_resource_unlock(a):
+    d = LOCKS / "resources" / a.name
+    o = read_json(d / "owner.json") or {}
+    if o.get("owner") not in (a.owner, None):
+        sys.exit(f"orch: {a.name} held by {o.get('owner')}, not {a.owner}")
+    shutil.rmtree(d, ignore_errors=True)
+    print(f"{a.name} released")
+
+
+def cmd_merge_unlock(a):
+    d = merge_dir(a.repo)
+    o = read_json(d / "owner.json") or {}
+    if o.get("owner") not in (a.owner, None):
+        sys.exit(f"orch: merge lock held by {o.get('owner')}, not {a.owner}")
+    shutil.rmtree(d, ignore_errors=True)
+    print("merge lock released")
+
+
+def cmd_merged(a):
+    o = owner_info(a.repo) or {}
+    run_id, sl = a.run or o.get("run"), a.slice or o.get("slice")
+    if not run_id or not sl:
+        sys.exit("orch: merged needs --run/--slice (or a registered worktree)")
+    slug, me = slug_of(a.repo), f"{run_id}-{sl}"
+    branch = a.branch or o.get("target") or default_branch(a.repo)
+    EVENTS.mkdir(parents=True, exist_ok=True)
+    with open(EVENTS / f"{slug}.jsonl", "a") as f:
+        f.write(json.dumps({"at": now(), "event": "merged", "by": me, "branch": branch, "sha": a.sha, "summary": a.summary}) + "\n")
+    w = RUNS / run_id / "workers" / f"{sl}.json"
+    wk = read_json(w)
+    if wk:
+        wk.update(status="merged", sha=a.sha, merged=now())
+        write_json(w, wk)
+    # Workers never message other workers: only coordinators are told; each relays to its own workers.
+    told, failed = [], []
+    for d, r in runs_for(slug):
+        if r["id"] == run_id:
+            continue  # own coordinator learns from the worker's MERGED report
+        waiting = [wk["name"] for _, wk in workers_of(d) if wk["name"] != me and wk.get("target") == branch]
+        text = (f"MOVED: {me} pushed {a.sha[:10]} to origin/{branch} ({a.summary}). "
+                + (f"Your workers pushing to {branch}: {', '.join(waiting)} — relay: "
+                   f"orch broadcast --run {r['id']} --branch {branch} \"REBASE: ...\"" if waiting
+                   else f"None of your workers push to {branch}; note it for integration."))
+        c = r.get("coordinator")
+        if c:
+            (told if cmux_message(c, text, me) else failed).append(f"coordinator of {r['id']}")
+    print(f"recorded; told: {', '.join(told) or '-'}")
+    if failed:
+        print(f"UNDELIVERED (push-guard still blocks stale pushes): {', '.join(failed)}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="orch", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="command", required=True)
+    c = s.add_parser("new-run"); c.add_argument("--repo", default="."); c.add_argument("--title", required=True); c.add_argument("--coordinator"); c.add_argument("--coordinator-workspace")
+    c = s.add_parser("spawn"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--resume", action="store_true"); c.add_argument("--all-mcp", action="store_true", help="give the worker every MCP server"); c.add_argument("--native", action="store_true", help="slice needs the iOS Simulator (keeps cmux Computer Use)")
+    c = s.add_parser("close"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done"); c.add_argument("--keep-worktree", action="store_true")
+    c = s.add_parser("run-branch"); c.add_argument("--run", required=True)
+    c = s.add_parser("baseline"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("--setup", help="e.g. 'npm ci'"); c.add_argument("--cmd", action="append", required=True)
+    c = s.add_parser("add-worker"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--workspace", required=True)
+    for n in ("lock", "unlock"):
+        c = s.add_parser(n); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True); c.add_argument("files", nargs="*")
+    c = s.add_parser("locks"); c.add_argument("--repo", default=".")
+    c = s.add_parser("criteria-init"); c.add_argument("--run", required=True); c.add_argument("--file", required=True)
+    c = s.add_parser("criteria-add"); c.add_argument("--run", required=True); c.add_argument("--file", required=True)
+    c = s.add_parser("ports"); c.add_argument("--run", required=True); c.add_argument("--name", required=True, help="e.g. integrate-verifier"); c.add_argument("--release", action="store_true")
+    c = s.add_parser("criteria-check"); c.add_argument("--run", required=True); c.add_argument("--sha")
+    c = s.add_parser("doctor"); c.add_argument("--run"); c.add_argument("--fix", action="store_true")
+    c = s.add_parser("finish-worker"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done")
+    c = s.add_parser("end-run"); c.add_argument("--run", required=True); c.add_argument("--status", default="done", choices=["done", "aborted"]); c.add_argument("--keep-sim", action="store_true")
+    c = s.add_parser("reap"); c.add_argument("--run"); c.add_argument("--dry-run", action="store_true"); c.add_argument("--keep-sim", action="store_true")
+    c = s.add_parser("status"); c.add_argument("--run"); c.add_argument("--all", action="store_true")
+    c = s.add_parser("broadcast"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("text")
+    c = s.add_parser("dash"); c.add_argument("--run", required=True); c.add_argument("--every", type=float, default=2); c.add_argument("--once", action="store_true"); c.add_argument("--open", action="store_true", help="open it as a workspace in the run's group")
+    c = s.add_parser("note"); c.add_argument("--run", required=True); c.add_argument("--plan", help="JSON [{id,title,wave,depends}]"); c.add_argument("--wait", help="add an item waiting on the user"); c.add_argument("--done", help="clear waiting item N, or 'all'"); c.add_argument("--next-tick", help="HH:MM of the next cron tick"); c.add_argument("--finish", type=int, choices=range(0, 7), help="run-finish step the coordinator is on (0 not started … 6 done)")
+    c = s.add_parser("report"); c.add_argument("--run", required=True); c.add_argument("--stall", type=int, default=15, help="minutes without progress = STALLED")
+    c = s.add_parser("register"); c.add_argument("--worktree", default="."); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--target"); c.add_argument("--risky", action="store_true"); c.add_argument("--sync", action="store_true", help="fresh worktree: reset to origin/<target>")
+    c = s.add_parser("gates"); c.add_argument("--worktree", default="."); c.add_argument("--cmd", action="append", required=True)
+    c = s.add_parser("verdict"); c.add_argument("--worktree", default="."); c.add_argument("--role", required=True, choices=["reviewer", "adversarial", "verifier"]); c.add_argument("--verdict", required=True, choices=["PASS", "BLOCK", "FAIL", "BLOCKED"]); c.add_argument("--mode", default="full", choices=["full", "re-review", "specs-only", "lite"]); c.add_argument("--summary", default="")
+    c = s.add_parser("tier"); c.add_argument("--repo", default="."); c.add_argument("--set", choices=["S", "M", "L"]); c.add_argument("--replace", action="store_true", help="drop an unshipped tier-S record for unrelated work"); c.add_argument("--clear", action="store_true", help="drop the tier record (abandoned change)")
+    c = s.add_parser("criterion"); c.add_argument("--run", required=True); c.add_argument("--id", required=True); c.add_argument("--status", required=True, choices=["pass", "fail", "not-exercised"]); c.add_argument("--sha", required=True); c.add_argument("--evidence", default="")
+    c = s.add_parser("gates-ok"); c.add_argument("--worktree", default="."); c.add_argument("--evidence", default=""); c.add_argument("--accept-failures")
+    c = s.add_parser("merge-lock"); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True); c.add_argument("--wait", type=int, default=1800)
+    c = s.add_parser("resource-lock"); c.add_argument("--name", required=True, choices=RESOURCES); c.add_argument("--owner", required=True); c.add_argument("--wait", type=int, default=1800)
+    c = s.add_parser("resource-unlock"); c.add_argument("--name", required=True, choices=RESOURCES); c.add_argument("--owner", required=True)
+    c = s.add_parser("merge-unlock"); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True)
+    c = s.add_parser("merged"); c.add_argument("--repo", default="."); c.add_argument("--run"); c.add_argument("--slice"); c.add_argument("--branch"); c.add_argument("--sha", required=True); c.add_argument("--summary", default="")
+    a = p.parse_args()
+    if a.command == "lock" and not a.files:
+        p.error("lock needs at least one file")
+    globals()["cmd_" + a.command.replace("-", "_")](a)
+
+
+if __name__ == "__main__":
+    main()
