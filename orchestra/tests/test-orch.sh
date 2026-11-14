@@ -25,7 +25,7 @@ chmod +x $S/stub/caffeinate $S/stub/xcrun $S/stub/osascript $S/stub/pgrep $S/cmu
 PASS=0; FAIL=0
 expect(){ # expect <label> <want: allow|ask|deny|silent> <cwd> <cmd>
   out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$3\",\"tool_input\":{\"command\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$4")}}" | python3 $H 2>&1); rc=$?
-  got=silent; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask
+  got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask
   if [ $got = $2 ]; then PASS=$((PASS+1)); echo "ok   $1"; else FAIL=$((FAIL+1)); echo "FAIL $1: want $2 got $got :: $out"; fi; }
 ok(){ if "$@" >/dev/null 2>&1; then PASS=$((PASS+1)); echo "ok   cmd: ${*:2:3}"; else FAIL=$((FAIL+1)); echo "FAIL cmd should succeed: $*"; "$@"; fi; }
 no(){ if "$@" >/dev/null 2>&1; then FAIL=$((FAIL+1)); echo "FAIL cmd should fail: $*"; else PASS=$((PASS+1)); echo "ok   refused: ${*:2:3}"; fi; }
@@ -36,8 +36,8 @@ R=$S/repo; RUN=$($O new-run --repo $R --title t --coordinator workspace:0); ok $
 git fetch -q; git worktree add -q .claude/worktrees/w1 -b w1 origin/orch/$RUN; git worktree add -q .claude/worktrees/w2 -b w2 origin/orch/$RUN; git worktree add -q .claude/worktrees/plain -b plain origin/main
 W1=$R/.claude/worktrees/w1; W2=$R/.claude/worktrees/w2; P=$R/.claude/worktrees/plain
 echo "-- unregistered"
-expect "push from main checkout allowed" allow $R "git push origin main"
-expect "commit in plain claude -w worktree allowed" allow $P "git commit -m x"
+expect "push from main checkout → no decision (user's rules)" silent $R "git push origin main"
+expect "commit in plain claude -w worktree → no decision (user's rules)" silent $P "git commit -m x"
 expect "force push always denied" deny $R "git push --force origin main"
 expect "delete refspec denied" deny $R "git push origin :main"
 ok $O register --worktree $W1 --run $RUN --slice s1; ok $O register --worktree $W2 --run $RUN --slice s2 --risky

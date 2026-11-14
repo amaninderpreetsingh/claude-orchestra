@@ -3,7 +3,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-msg.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block: reap kills unowned listeners in its range
+export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block, so this suite's allocations never collide with another's
 mkdir -p $S/stub; for x in caffeinate xcrun osascript; do printf '#!/bin/sh\nexit 0\n' > $S/stub/$x; chmod +x $S/stub/$x; done; export PATH=$S/stub:$PATH  # never the real caffeinate/simulators
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo; echo a>a; git add .; git commit -qm i; git push -q origin main; git remote set-head origin main
 RUN=$($O new-run --repo . --title m --coordinator workspace:7); git worktree add -q .claude/worktrees/w -b w origin/main; W=$S/repo/.claude/worktrees/w

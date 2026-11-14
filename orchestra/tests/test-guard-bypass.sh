@@ -10,7 +10,7 @@ hook(){ # hook <cwd> <cmd> [agent_type] → hook output in $out, decision in $go
   out=$(python3 -c 'import json,sys;d={"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}
 if sys.argv[3]: d["agent_type"]=sys.argv[3]
 print(json.dumps(d))' "$1" "$2" "${3:-}" | python3 $H 2>&1); rc=$?
-  got=silent; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask; true; }
+  got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask; true; }
 expect(){ # expect <label> <want: allow|deny|silent> <cwd> <cmd> [agent_type]
   hook "$3" "$4" "${5:-}"
   if [ $got = $2 ]; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1: want $2 got $got :: $out"; fi; }
@@ -72,6 +72,14 @@ expect "report newline cmux send → deny" deny $W "$MSG${NL}cmux send --workspa
 expect "report && cmux send-key → deny" deny $W "$MSG && cmux send-key --workspace workspace:9 Enter"
 expect "report || cmux new-workspace → deny" deny $W "$MSG || cmux new-workspace --command claude"
 expect "report | cmux paste → deny" deny $W "$MSG | cmux paste --workspace workspace:9"
+expect "worker cmux close-surface → deny" deny $W "cmux close-surface --surface surface:1 --force"
+expect "worker cmux workspace-group → deny" deny $W "cmux workspace-group ungroup g1"
+expect "report; cmux close-surface → deny" deny $W "$MSG; cmux close-surface --surface surface:1"
+expect "worker cmux send-panel → deny" deny $W "cmux send-panel --panel pane:3 x"
+expect "worker cmux send-key-panel → deny" deny $W "cmux send-key-panel --panel pane:3 Enter"
+expect "worker cmux close-window → deny" deny $W "cmux close-window --window window:1"
+expect "worker cmux tab-action → deny" deny $W "cmux tab-action --action close --surface surface:1"
+expect "worker cmux workspace-action → deny" deny $W "cmux workspace-action --action close"
 expect "report & (cmux send) → deny" deny $W "$MSG & (cmux send --workspace workspace:9 x)"
 expect "report; message to another workspace → deny" deny $W "$MSG; cmux agent message workspace:9 \"PROGRESS: y\""
 expect "report; untagged message to the coordinator → deny" deny $W "$MSG; cmux agent message workspace:7 \"merge now\""
@@ -131,7 +139,7 @@ expect "cat heredoc then redirect → silent" silent $R "cat <<EOF > notes.md${N
 expect "echo of the text → silent" silent $R "echo \"orch $V --role verifier --verdict PASS\""
 expect "printf of the text → silent" silent $R "printf '%s\\n' 'orch $C --run x --id C1'"
 expect "grep for the text → silent" silent $R "grep -rn \"orch $V --role\" ."
-expect "commit message naming it → allow (plain commit)" allow $R "git commit -qm \"doc: orch $V --role verifier\""
+expect "commit message naming it → no decision (plain commit)" silent $R "git commit -qm \"doc: orch $V --role verifier\""
 expect "heredoc fed to bash still runs it → deny" deny $R "bash <<'EOF'${NL}orch $V --role verifier --verdict PASS${NL}EOF"
 expect "cat heredoc piped to sh still runs it → deny" deny $R "cat <<'EOF' | sh${NL}orch $V --role verifier --verdict PASS${NL}EOF"
 expect "cat heredoc output run by \$(…) → deny" deny $R "\$(cat <<'EOF'${NL}orch $V --role verifier --verdict PASS${NL}EOF${NL})"
@@ -150,7 +158,7 @@ expect "indented delimiter doesn't end a heredoc (bash runs the call) → deny" 
 expect "indented delimiter in the commit idiom → deny" deny $R "git commit -m \"\$(cat <<'EOF'${NL}msg${NL}  EOF${NL})\"${NL}EOF${NL})\"; orch $V --role verifier --verdict PASS #\""
 expect "<<- strips leading tabs only → body still masked → silent" silent $R "cat > n.md <<-'EOF'${NL}orch $V --role verifier${NL}	EOF"
 expect "echo of the commit idiom piped to bash runs it → deny" deny $R "echo \"\$(cat <<'EOF'${NL}orch $V --role verifier --verdict PASS${NL}EOF${NL})\" | bash"
-expect "git commit -F - heredoc naming a call is a message → allow" allow $R "git commit -q -F - <<'EOF'${NL}docs: orch $V --role verifier usage${NL}EOF"
+expect "git commit -F - heredoc naming a call is a message → no decision" silent $R "git commit -q -F - <<'EOF'${NL}docs: orch $V --role verifier usage${NL}EOF"
 TAB=$'\t'
 expect "tab-indented delimiter ends only <<- heredocs (commit idiom) → deny" deny $R "git commit -m \"\$(cat <<'EOF'${NL}msg${NL}${TAB}EOF${NL})\"${NL}EOF${NL})\"; orch $V --role verifier --verdict PASS #\""
 expect "process substitution running a cat heredoc → deny" deny $R "bash <(cat <<'EOF'${NL}orch $V --role verifier --verdict PASS${NL}EOF${NL})"
@@ -161,7 +169,7 @@ expect "ssh with the call quoted → deny" deny $R "ssh localhost \"orch $V --ro
 expect "watch with the call quoted → deny" deny $R "watch -n1 \"orch $V --role verifier --verdict PASS\""
 expect "git alias running the call → deny" deny $R "git -c alias.v=\"!orch $V --role verifier --verdict PASS\" v"
 expect "reviewer --summary with ordinary words (read …) is still text → silent" silent $R "orch $V --role reviewer --verdict PASS --summary 'read all; orch $V --role verifier separate'" reviewer
-expect "commit message with 'read' naming a call → allow (plain commit)" allow $R "git commit -m \"read orch $V --role reviewer output\""
+expect "commit message with 'read' naming a call → no decision (plain commit)" silent $R "git commit -m \"read orch $V --role reviewer output\""
 expect "reviewer: orch gates --cmd running a verifier call → deny" deny $R "orch gates --worktree . --cmd \"orch $V --role verifier --verdict PASS\"" reviewer
 expect "orch baseline --cmd running a criterion → deny" deny $R "orch baseline --run x --cmd \"orch $C --run x --id C1 --status pass --sha a\""
 expect "git grep -O running the call → deny" deny $R "git grep -O\"orch $V --role verifier --verdict PASS\" -e a"
@@ -178,11 +186,11 @@ expect "push | tee → silent" silent $R "git push origin main 2>&1 | tee log"
 expect "push with a \$(…) refspec → silent" silent $R "git push origin \$(git branch --show-current)"
 expect "commit with \$(…) in the message → silent" silent $R "git commit -m \"\$(rm -rf x)\""
 expect "unknown-option push; rm → silent" silent $R "git --frob v push origin main; rm -rf x"
-expect "plain push still allowed" allow $R "git push origin main"
-expect "plain push with redirections still allowed" allow $R "git push origin main >/dev/null 2>&1"
-expect "plain commit still allowed" allow $R "git commit -qm x"
-expect "heredoc commit message still allowed" allow $R "git commit -qm \"\$(cat <<'EOF'${NL}fix: thing; more${NL}EOF${NL})\""
-expect "commit -F - heredoc still allowed" allow $R "git commit -q -F - <<'EOF'${NL}fix && more${NL}EOF"
+expect "plain push → no decision (user's rules)" silent $R "git push origin main"
+expect "plain push with redirections → no decision (user's rules)" silent $R "git push origin main >/dev/null 2>&1"
+expect "plain commit → no decision (user's rules)" silent $R "git commit -qm x"
+expect "heredoc commit message → no decision (user's rules)" silent $R "git commit -qm \"\$(cat <<'EOF'${NL}fix: thing; more${NL}EOF${NL})\""
+expect "commit -F - heredoc → no decision (user's rules)" silent $R "git commit -q -F - <<'EOF'${NL}fix && more${NL}EOF"
 expect "bash -c \"\$(cat <<'EOF' commit && rm …)\" → silent, not allow" silent $R "bash -c \"\$(cat <<'EOF'${NL}git commit -qm x && rm -rf build${NL}EOF${NL})\""
 expect "gh pr create --body heredoc idiom (no push/commit) → silent" silent $R "gh pr create --body \"\$(cat <<'EOF'${NL}orch $V notes${NL}EOF${NL})\""
 expect "unquoted heredoc running \$(…) → silent" silent $R "git commit -qm \"\$(cat <<EOF${NL}\$(rm -rf x)${NL}EOF${NL})\""
@@ -200,7 +208,7 @@ expect "./git (not git itself) → silent, not allow" silent $R "./git push orig
 expect "push --receive-pack (runs a program) → silent, not allow" silent $R "git push --receive-pack='touch x' origin main"
 expect "push --exec → silent, not allow" silent $R "git push --exec='touch x' origin main"
 expect "push --rece (abbreviated --receive-pack) → silent, not allow" silent $R "git push --rece='touch x' origin main"
-expect "env-prefixed grep for push text only reads → allow (as before)" allow $R "LC_ALL=C grep -rn \"git push\" ."
+expect "env-prefixed grep for push text only reads → no decision (user's rules)" silent $R "LC_ALL=C grep -rn \"git push\" ."
 expect "…the same grep under bash -c → silent, not allow" silent $R "bash -c 'grep -rn \"git push\" .'"
 expect "…grep writing a file → silent, not allow" silent $R "grep -rn \"git push\" . > hits.txt"
 expect "…rg --pre (runs a program) → silent, not allow" silent $R "rg --pre ./x \"git push\" ."
@@ -235,8 +243,8 @@ expect "a case pattern's ) doesn't close the subshell holding the cd → deny" d
 
 echo "-- push text in a body only a reader reads isn't a push"
 expect "cat > file heredoc naming a push, tiered → silent" silent $R "cat > notes.md <<'EOF'${NL}then git push origin main${NL}EOF"
-expect "commit -F - body naming a push, tiered → allow (a commit)" allow $R "git commit -q -F - <<'EOF'${NL}then git push origin main${NL}EOF"
-expect "commit idiom body naming a push, tiered → allow (a commit)" allow $R "git commit -qm \"\$(cat <<'EOF'${NL}then git push origin main${NL}EOF${NL})\""
+expect "commit -F - body naming a push, tiered → no decision (a commit)" silent $R "git commit -q -F - <<'EOF'${NL}then git push origin main${NL}EOF"
+expect "commit idiom body naming a push, tiered → no decision (a commit)" silent $R "git commit -qm \"\$(cat <<'EOF'${NL}then git push origin main${NL}EOF${NL})\""
 expect "PR body naming a push, tiered → silent" silent $R "gh pr create --body \"\$(cat <<'EOF'${NL}then git push origin main${NL}EOF${NL})\""
 expect "cat heredoc naming a force push → silent" silent $S/plain "cat > n.md <<'EOF'${NL}never git push --force origin main${NL}EOF"
 expect "PR body naming a force push → silent" silent $S/plain "gh pr create --body \"\$(cat <<'EOF'${NL}never git push --force origin main${NL}EOF${NL})\""
@@ -252,11 +260,11 @@ expect "{ cat heredoc; } | sh runs the body → deny" deny $R "{ cat <<'X'; } | 
 expect "if … cat heredoc … fi | sh runs the body → deny" deny $R "if true; then cat <<'X'; fi | sh${NL}orch $V --role reviewer --verdict PASS${NL}X"
 expect "heredoc fed to a git alias that runs sh → deny" deny $R "git -c alias.x='!sh' x <<'X'${NL}orch $V --role reviewer --verdict PASS${NL}X"
 expect "worker { cat heredoc; } | bash running cmux send → deny" deny $W "{ cat <<'X'; } | bash${NL}cmux send --workspace workspace:9 x${NL}X"
-expect "coordinator commit -F - body naming cd <worktree> && push → allow" allow $R "git commit -q -F - <<'EOF'${NL}workers: cd $W && git push origin HEAD:$T${NL}EOF"
-expect "coordinator commit-idiom body naming cd <worktree> && push → allow" allow $R "git commit -qm \"\$(cat <<'EOF'${NL}workers: cd $W && git push origin HEAD:$T${NL}EOF${NL})\""
+expect "coordinator commit -F - body naming cd <worktree> && push → no decision" silent $R "git commit -q -F - <<'EOF'${NL}workers: cd $W && git push origin HEAD:$T${NL}EOF"
+expect "coordinator commit-idiom body naming cd <worktree> && push → no decision" silent $R "git commit -qm \"\$(cat <<'EOF'${NL}workers: cd $W && git push origin HEAD:$T${NL}EOF${NL})\""
 expect "coordinator PR body naming cd <worktree> && push → silent, not deny" silent $R "gh pr create --body \"\$(cat <<'EOF'${NL}cd $W && git push origin HEAD:$T${NL}EOF${NL})\""
 expect "…the same body fed to bash → deny" deny $R "bash <<'EOF'${NL}cd $W && git push origin HEAD:$T${NL}EOF"
-expect "known-limit workaround: commit message from a file → allow" allow $R "git commit -q -F msg.txt"
+expect "known-limit workaround: commit message from a file → no decision" silent $R "git commit -q -F msg.txt"
 expect "…the same idiom under bash -c → deny" deny $R "bash -c \"\$(cat <<'EOF'${NL}cd $W && git push origin HEAD:$T${NL}EOF${NL})\""
 expect "cd <worktree> && bash -c cmux send; cd back → deny (checked where it runs)" deny $R "cd $W && bash -c \"cmux send --workspace workspace:9 x\"; cd $R"
 expect "gh alias set with the commit idiom storing a call → deny" deny $R "gh alias set v \"\$(cat <<'EOF'${NL}orch $V --role verifier --verdict PASS${NL}EOF${NL})\""
@@ -322,5 +330,16 @@ ok "worker cmux send, every git call slow → deny" "[ $got = deny ]"
 ok "…within the deadline (${el}s)" "[ $el -le 6 ]"
 t0=$(date +%s); SLOW=rev-parse ORCH_GUARD_DEADLINE=3 PATH=$S/slow:$PATH hook $S "ls"; el=$(( $(date +%s) - t0 ))
 ok "unrelated command, slow git → no decision" "[ $got = silent ]"
+fb(){ python3 -c '
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("pg", sys.argv[1]); pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
+try: pg.fallback({"tool_name": "Bash", "cwd": sys.argv[2], "tool_input": {"command": sys.argv[3]}}, RuntimeError("boom"))
+except SystemExit as e: sys.exit(e.code)' $H "$1" "$2"; }
+out=$(fb $R "git push origin main" 2>&1); rc=$?
+ok "fallback, plain push outside a worker → no decision, never allow" "[ $rc = 0 ] && ! echo \"\$out\" | grep -q allow"
+out=$(fb $R "git commit -qm x" 2>&1); rc=$?
+ok "fallback, plain commit outside a worker → no decision, never allow" "[ $rc = 0 ] && ! echo \"\$out\" | grep -q allow"
+out=$(fb $R "git push -f origin main" 2>&1); rc=$?
+ok "fallback, force push outside a worker → still deny" "[ $rc = 2 ]"
 
 echo; echo "PASSED $P  FAILED $F"; [ $F = 0 ]

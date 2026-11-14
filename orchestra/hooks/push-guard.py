@@ -3,25 +3,29 @@
 
 Orchestra worktree = its git dir holds orchestra-owner.json (written by `orch register`).
 There, a push is allowed only when ALL hold (otherwise denied with the fix, exit 2):
-  1. it is exactly one refspec to the registered branch: git push [-q|-v|-u|-n|-o x] origin HEAD:<target>
+  1. the whole command is the one allowed form, matched as a whole (worker_push(), plus git_itself):
+     git push origin HEAD:<target>   (or HEAD:refs/heads/<target>; optionally after `cd <a dir in this worktree> && `)
+     — no options, env prefix, git -c/-C, wrapper (nohup, env, sudo …), redirection, chaining or piping.
+     A push into a worker worktree from outside a worker session runs the same checks (any option denies) but, like
+     every push outside a worker, gets no decision when they pass.
   2. HEAD contains the latest origin/<target>       (someone else pushed → rebase first)
   3. `orch gates-ok` was recorded for this exact HEAD (gates run + reviewer/verifier PASS)
   4. this worker holds the repo's merge lock         (pushes are serialized)
-  5. it is the whole command: a worker push chained/piped with anything else is denied (one plain command)
-Inside an orchestra worktree the guard FAILS CLOSED: any error denies the push.
-Outside one, only a push or commit that is one plain command run by git itself is allowed without a prompt (user,
-2026-10-28; see git_itself); a compound one, or git wrapped by bash -c/eval/ssh/sudo or pointed at another program,
-gets no decision, so the user's own permission rules apply (auto mode avoids prompts in unattended runs); except while
-a recorded tier change is unshipped (see check_tier): tier S needs passing gates + a reviewer PASS on the pushed commit, and
-tier M/L never ships from a main checkout. Force/delete pushes are always denied.
+Inside an orchestra worktree the guard FAILS CLOSED: any error denies the push. A worker's commits get no decision.
+Outside a worker session the guard never allows: it only denies (a force/delete push, a tier record whose checks
+fail, a push into a worker worktree that fails the worker checks, evidence recorded by the wrong caller, …) or gives
+no decision, so the user's own permission rules decide every push and commit there — a plain one, a compound one, and
+a tier-record push that passes its checks alike. While a recorded tier change is unshipped (see check_tier), tier S
+needs passing gates + a reviewer PASS on the pushed commit, and tier M/L never ships from a main checkout.
+Force/delete pushes are always denied.
 Pushes are parsed like the shell would (backslash-newline joined, quotes removed, git global options before `push`
 read, `&>`/`>&`/`>|` kept as redirections); a push it can't parse exactly (unbalanced quotes, $ ` { * ? [ expansion)
-is denied in a worker or under a tier record and allowed elsewhere; a force flag or +/: refspec in any brace
+is denied in a worker or under a tier record and gets no decision elsewhere; a force flag or +/: refspec in any brace
 alternative is denied outright. The guard never asks: unattended runs can't answer a prompt.
 Every `git … push` in the text is a push, except inside a data string (see data_strings: grep -rn "git push" .).
 "Inside a worker" is the session's cwd; a worker push command with cd/pushd, or -C elsewhere, is denied.
 Threat model for the parser: accidental shortcuts, not a hostile agent — chasing every shell obfuscation is unbounded.
-Known limits: data run later (echo "…" > f; ./f), python -c subprocesses, `env -C <dir>` in a worker.
+Known limits: data run later (echo "…" > f; ./f), python -c subprocesses.
 Where a push runs is followed through ; && || newline, { } / if bodies, ( … ) / $( … ) scopes, quoted dirs, cd -- and
 pushd/popd (cwd_at); a cd it can't resolve ($X, -, a glob, a missing dir, one inside quotes such as bash -c "cd x && …")
 makes the checkout unknown: denied in a worker, or when any checkout it may run in is a worker or has a tier record.
@@ -31,14 +35,9 @@ only non-worker candidates: it binds tier records, not the coordinator's worker 
 So inside a worker, any command that mentions push AND uses shell indirection ($'…', $VAR, ${…}, $(…), backticks,
 {a,b}, eval, xargs, sh/bash -c, alias), or any git push written with a quote/backslash, is denied: write it plainly. Outside workers obfuscation (a quoted or
 escaped verb such as git 'push', a shell-built one, args fed by xargs) is out of scope.
-Outside workers the guard never allows a compound command (chained, piped, a subshell or $( … ), a heredoc fed to
-anything but cat/git/tee): it gives no decision, so the user's own permission rules (ask/deny) still cover the rest of
-the command (an allow would approve `git commit -m x && rm -rf build` whole). Nor one whose program isn't git itself
-(bash -c / sh -c / eval / ssh / sudo … run quoted text it can't vouch for), a grep that only reads aside, nor git
-pointed at another program or file: an env prefix other than LC_*/LANG/TZ (GIT_SSH_COMMAND=, PATH=), -c with a key
-other than color.*/advice.*/core.quotepath/user.name/user.email, --config-env/--exec-path, push --receive-pack/--exec
-(any abbreviation), a redirection into a file (/dev/null and &N aside), or a backgrounded command (&). Inside a worker a compound command
-holding a push is denied (workers run unattended, a prompt would stall them): push with one plain command.
+Inside a worker a compound command holding a push (chained, piped, backgrounded, a subshell or $( … ), a heredoc fed
+to anything but cat/git/tee) is denied, and so is any push that isn't the one allowed form above (an allow would
+approve the whole command; a prompt would stall the unattended worker): push with one plain command.
 Every cmux command a worker runs is checked (each ; && || | & newline segment), and every `orch verdict|criterion`
 call with every --role; text only a reader program reads (READERS: a cat/git heredoc, echo/printf/grep/…, a commit
 message, orch --summary, a cmux report) isn't a call — except where RUNS_ARGS lists a subcommand/flag that runs it
@@ -55,8 +54,8 @@ and cmux spelled in another case (CMUX on a case-insensitive volume), a cd targe
 $(git rev-parse --show-toplevel) are guessed), an absolute path to a program named git, and --git-dir=<repo>
 running that repo's hooks, a cat heredoc body inside an unquoted $( … ) / <( … ) (its output runs, but the body is
 read as data), printf -v capture later run by eval, and pushd -n / popd -n (taken as a cd; -n only edits the stack).
-Most get no decision (the user's rules apply);
-env -C and text run later are still allowed, as before this parser. The other way, a worker's non-reader command
+Outside a worker they get no decision (the user's rules apply), as every push and commit there does; a worker push
+in any of these shapes (env -C, /path/to/git, …) fails the exact-form match and is denied. The other way, a worker's non-reader command
 quoting a cmux verb (sed 's/cmux send/…/', python -c "…cmux send…") is denied: its text may run; and a cd named
 in a multi-line git commit -m "…" or a gh … --body "…" text can make a worker worktree a candidate, denying the
 coordinator's commit/PR (fails closed; write the message to a file: git commit -F file, gh … --body-file file).
@@ -593,9 +592,9 @@ SAFE_CONFIG = re.compile(r"(?:color|advice)\.[\w.-]+|core\.quotepath|user\.(?:na
 
 
 def git_itself(cmd):
-    """One simple command whose program is git itself (not bash -c / sh -c / eval / ssh / sudo … around it), or a
-    grep that only reads (no redirection, nothing in RUNS_ARGS): the only command push-guard may allow outright outside
-    a worker."""
+    """One simple command whose program is git itself (not bash -c / sh -c / eval / ssh / sudo … around it, no -c key
+    that runs a program, no redirection into a file). Kept as defence in depth on top of the stricter worker_push()
+    match, which already denies every prefix (LC_* included) before a worker push is allowed."""
     p = parsed(cmd)
     if compound(cmd, p):
         return False
@@ -625,7 +624,7 @@ def git_itself(cmd):
         # push/fetch options naming a program to run, in any abbreviation git accepts (--rece, --e)
         return not any(len(n) > 2 and o.startswith(n) for n in (t.split("=", 1)[0] for t in toks[i:] if t[:2] == "--")
                        for o in RUNNING_OPTS)
-    return toks[0] in ("grep", "egrep", "fgrep") and reads_only(t)
+    return False
 
 
 def git_globals(gopts):
@@ -671,9 +670,11 @@ def read(p, default):
 VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 # long options git also accepts abbreviated (--mirr); any prefix of these, or extension of them, is force/delete
 FORCE_LONG = ("force", "force-with-lease", "force-if-includes", "mirror", "delete", "all", "branches", "tags", "prune")
-# a worker push may carry only these; the -o/--push-option value is skipped
-WORKER_OPTS = {"-q", "--quiet", "-v", "--verbose", "-u", "--set-upstream", "-n", "--dry-run", "--porcelain",
-               "--progress", "--no-progress", "--atomic", "-o", "--push-option"}
+
+
+def worker_push(target):
+    """The one push a worker may run, matched against its whole command (after an own-worktree `cd … &&`)."""
+    return re.compile(rf"git[ \t]+push[ \t]+origin[ \t]+HEAD:(?:refs/heads/)?{re.escape(target)}")
 
 
 def is_force(t):
@@ -874,7 +875,8 @@ def check_worker_indirection(data, cmd, raw):
 
 def check_unmatched_git(data, cmd):
     """`git <options we don't know> push …`: the verb is push (only option-like words, each with at most one value,
-    sit between git and it) but PUSH didn't match. Unparseable: deny in a worker or under a tier record, else allow."""
+    sit between git and it) but PUSH didn't match. Unparseable: deny in a worker or under a tier record, else no
+    decision."""
     found = None
     for seg in re.split(r"[;&|\n]", cmd):
         if PUSH.search(seg) or not PUSH_WORD.search(seg):
@@ -897,7 +899,7 @@ def check_unmatched_git(data, cmd):
                 if active_tier(cwd):
                     decide("deny", "A tier record is unshipped and push-guard doesn't know an option before `push`; "
                                    "run it plainly: git push origin <branch>")
-            found = "allow", "push with an option push-guard doesn't know, outside a worker (no force, no tier record)"
+            found = "none", "push with an option push-guard doesn't know, outside a worker: the user's rules apply"
     return found
 
 
@@ -909,8 +911,8 @@ def own_lead(data, cmd, here):
     return None
 
 
-def check_push(data, cmd, m):
-    """One `git push` in cmd (match m). Denies (exits); otherwise returns (allow, reason). "Inside a worker" is the
+def check_push(data, cmd, m, exact=False):  # exact: main's whole-command match; fails closed when left out
+    """One `git push` in cmd (match m). Denies (exits); otherwise returns (allow|none, reason). "Inside a worker" is the
     session's cwd: a worker session can't leave its worktree by cd (any cd/pushd in a worker push command denies)."""
     words, parsed = shell_words(cmd, m.end()), True
     try:
@@ -956,16 +958,18 @@ def check_push(data, cmd, m):
         if active_tier(cwd):
             decide("deny", "A tier record is unshipped and push-guard can't parse this push exactly (quoting or shell "
                            "expansion); run it plainly: git push origin <branch>")
-        return "allow", "push outside an orchestra worker that push-guard can't parse exactly (no force, no tier record)"
+        return "none", "push outside an orchestra worker that push-guard can't parse exactly: the user's rules apply"
     if owner is None:
         check_tier(cwd, gitdir, pos)
-        return "allow", "normal push outside an orchestra worker (tier record checked if any)"
+        return "none", "push outside an orchestra worker (tier record checked if any): the user's rules apply"
     target = owner["target"]
 
-    bad = [o for o in opts if o.split("=", 1)[0] not in WORKER_OPTS and not re.fullmatch(r"-[qvun]+|-[qvun]*o.*", o)]
-    if bad or len(pos) != 2 or pos[0] != "origin" or pos[1] not in (f"HEAD:{target}", f"HEAD:refs/heads/{target}"):
+    if opts or len(pos) != 2 or pos[0] != "origin" or pos[1] not in (f"HEAD:{target}", f"HEAD:refs/heads/{target}"):
         decide("deny", f"Push exactly your registered branch, nothing else: git push origin HEAD:{target}"
-                       + (f" (not allowed in a worker push: {' '.join(bad)})" if bad else ""))
+                       + (f" (no options in a worker push: {' '.join(opts)})" if opts else ""))
+    if here is not None and not exact:  # before the fetch: the cheap whole-command check (see main)
+        decide("deny", f"From a worker, push with exactly this command and nothing else (no options, env prefix, "
+                       f"git -c/-C, wrapper or redirection): git push origin HEAD:{target}")
 
     if git("fetch", "--quiet", "origin", target, cwd=cwd)[0] != 0:
         decide("deny", f"Could not fetch origin/{target}; can't prove you're current. Fix the remote and retry.")
@@ -1117,7 +1121,9 @@ def check_evidence_writer(data, cmd):
 CMUX_WORD = re.compile(r"(?<![\w.-])cmux(?![\w.-])")  # cmux, /path/to/cmux; not cmux-x / .cmux
 WORKER_TAGS = ("QUESTION:", "NEEDS_FILES:", "BLOCKED:", "MERGED:", "PROGRESS:", "DONE:")
 WORKER_FORBIDDEN = {"send", "send-key", "paste", "new-workspace", "close-workspace", "workspace",
-                    "new-split", "new-pane", "claude-teams"}
+                    "new-split", "new-pane", "claude-teams", "close-surface", "workspace-group",
+                    "send-panel", "send-key-panel", "paste-buffer", "close-window", "tab-action", "workspace-action",
+                    "new-window", "new-surface", "respawn-pane", "codex-teams"}
 
 
 def check_worker_messaging(data, cmd):
@@ -1220,31 +1226,28 @@ def main(data):
     cmd = raw if continued else inert_text(blank_data(raw))  # quoted data and bodies only read aren't pushes
     check_worker_indirection(data, cmd, raw)
     here = owner_of(data.get("cwd") or os.getcwd())[0] if PUSH.search(cmd) else None
+    exact = True
     if here is not None:  # a worker push is the whole command (an allow would approve the chain; a prompt would
-        end = own_lead(data, original, here)  # stall the unattended worker) — `cd <own wt> &&` aside
-        if compound(original if end is None else original[end:]):
+        end = own_lead(data, raw, here)  # stall the unattended worker) — `cd <own wt> &&` aside
+        rest = raw if end is None else raw[end:]
+        if compound(rest):
             decide("deny", f"Worker pushes must be one plain command, nothing chained, piped or substituted: "
                            f"git push origin HEAD:{here['target']}")
-    ok = [check_push(data, cmd, m) for m in PUSH.finditer(cmd)]  # every push in the command must pass
+        # the one exact form, matched whole; strip only what bash itself drops around a command (a CR is a word)
+        exact = bool(worker_push(here["target"]).fullmatch(rest.strip(" \t\n")) and git_itself(rest))
+    # every push in the command must pass; check_push denies a worker push that isn't exact, before its fetch
+    ok = [check_push(data, cmd, m, exact) for m in PUSH.finditer(cmd)]
     ok += filter(None, [check_unmatched_git(data, cmd)])
-    c = COMMIT.search(cmd)
-    if not ok and c:
-        cwd = cwd_at(data, cmd, c.start(), git_globals(c.group("g"))[0])[0]
-        if cwd is None or owner_of(cwd)[0] is not None:
-            return  # in a worker (or can't tell) a commit gets no decision
-        ok = [("allow", "git commit outside an orchestra worker: no prompt")]
-    if ok:  # never "ask": unattended runs can't answer a prompt
-        if any(d == "none" for d, _ in ok):
-            return  # a push it can't place: not approved, the user's own rules apply
-        if here is None and not git_itself(original):  # outside a worker an allow would approve the whole chain
-            return  # (or what bash -c / eval / ssh runs): no decision, the user's own rules apply
+    # Only a worker's own push is ever allowed (never "ask": unattended runs can't answer a prompt). Outside a worker
+    # session, and for any commit, no decision: the user's own permission rules apply.
+    if here is not None and ok and all(d == "allow" for d, _ in ok):
         decide("allow", "; ".join(r for _, r in ok) + ".")
 
 
 def fallback(data, e):
     """The checks crashed or ran out of time. Fail closed for a push inside a worker, under a tier record (recorded at
     all, when out of time) or with a force/delete marker, for a worker's cmux/broadcast call and for an evidence call
-    by the wrong agent; also when it can't tell. Elsewhere a plain (not compound) push or commit is allowed."""
+    by the wrong agent; also when it can't tell. Elsewhere it gives no decision (never allows)."""
     PHASE["reserve"] = 0  # the reserved seconds are the fallback's; then a hard stop
     arm(left())
     timed_out = isinstance(e, Deadline)
@@ -1277,11 +1280,7 @@ def fallback(data, e):
         if in_orch or tier or any(is_force(w) for w in re.split(r"[\s\"'{},;&|()]+", cmd) if w):
             decide("deny", f"{why}; refusing a push from a worker, under a tier record, with a force/delete marker "
                            f"or where it can't tell.")
-        if git_itself(original):
-            decide("allow", f"{why}; plain push outside a worker allowed.")
-    elif COMMIT.search(cmd) and not in_orch and git_itself(original):  # in a worker: no decision, as normally
-        decide("allow", f"{why}; git commit outside a worker allowed.")
-    disarm()
+    disarm()  # anything else (a push or commit outside workers): no decision, the user's own rules apply
 
 
 if __name__ == "__main__":
