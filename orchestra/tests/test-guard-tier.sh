@@ -31,7 +31,8 @@ ok "lite mode accepted" "$O $V --worktree $R --role reviewer --verdict BLOCK --m
 expect "latest reviewer BLOCK → deny" deny $R "$PUSH"
 ok "lite PASS" "$O $V --worktree $R --role reviewer --verdict PASS --mode lite"
 expect "tier S + gates + lite PASS → allow" allow $R "$PUSH"
-expect "cd-prefixed push resolves the checkout" allow $S "cd $R && $PUSH"
+expect "cd-prefixed push resolves the checkout (not denied; compound: no decision, H4)" silent $S "cd $R && $PUSH"
+expect "-C push from elsewhere resolves the evidenced checkout → allow" allow $S "git -C $R push origin main"
 
 echo "-- evidence must be for HEAD"
 echo c > a.txt; git commit -qam c
