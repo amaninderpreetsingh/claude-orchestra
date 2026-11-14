@@ -45,7 +45,7 @@ Run the real tests for the touched area (including emulator integration/rules te
 Run the brief's Repro on the base (must fail with the user's symptom) and on HEAD (must pass).
 
 ## Mode `specs-only` (after a clean rebase, patch unchanged)
-Skip exploration and native/real-Chrome checks: rerun gates-related e2e + the slice's pinned specs and the Repro on HEAD. Any failure → switch to full.
+Skip §1, 2.3–2.4 and 2c: rerun each of your brief's criteria's own check on HEAD (its tests, pinned e2e specs, backend calls, Maestro flows) plus the Repro. Any failure → switch to full. Then re-record those criteria at the new HEAD (below): `end-run` refuses a criterion whose sha isn't on the default branch, and a pre-rebase sha never is.
 
 ## Record and report
 For each criterion you checked: `~/.claude/orchestra/bin/orch criterion --run <run> --id <Cn> --status <pass|fail|not-exercised> --sha <HEAD> --evidence "<kind: unit|emulator|dev-server|e2e — what you observed>"`.
