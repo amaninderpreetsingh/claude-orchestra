@@ -149,6 +149,8 @@ From the clone. It removes every file the installer copied and restores what it 
 
 **Every Bash command is blocked after I deleted `~/.claude/orchestra`.** The hook in `settings.json` still points at `push-guard.py`, and a missing hook script blocks every Bash call. Remove the push-guard hook entry from `~/.claude/settings.json` (`./uninstall.sh` can't: it needs the install manifest that lived in that folder).
 
+**Every git push/commit/cmux command is denied with "push-guard crashed".** The hook can't run on your `python3` (too old, or it fails to load the hook), and when it can't run it denies every command it guards rather than switching itself off. Install a `python3` >= 3.9 the hook loads with (`brew install python`) first on PATH, or rerun `./install.sh`: its python3 check loads the hook and reports what fails.
+
 **A push was denied.** Read the reason: push-guard names what's missing (gates, a verdict on this commit, the merge lock, a rebase). Fix that; never work around it.
 
 **A worker is BLOCKED.** It hit the 4-round cap or a question only you can answer. The coordinator asks you: restart fresh (from the worker's `## Learned` notes), re-scope, or drop the slice.

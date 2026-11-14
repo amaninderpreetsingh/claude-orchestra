@@ -408,6 +408,34 @@ for i in $(seq 1 20); do kill -0 ${KID:-0} 2>/dev/null || break; sleep 0.1; done
 ok "a hung child whose supervisor was killed (Claude Code's hook timeout) ends at once, never lingers" "! kill -0 ${KID:-0} 2>/dev/null"
 [ -n "$KID" ] && kill -9 $KID 2>/dev/null
 
+echo "-- SIGTERM/SIGHUP to the supervisor (a cancelled hook) fails closed like a crash, never exit 143/129"
+printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"ls -la"}}' > $S/hang-ls.json
+sig(){ # sig <TERM|HUP> <input file> → $rc, $out, $KID (the supervisor got the signal while its checks hung)
+  ORCH_GUARD_DEADLINE=30 python3 $S/pg-hang.py < "$2" > $S/sig.out 2>&1 & SUP=$!; KID=
+  for i in $(seq 1 50); do KID=$(pgrep -P $SUP | head -1); [ -n "$KID" ] && break; sleep 0.1; done
+  sleep 0.3; kill -$1 $SUP; wait $SUP; rc=$?; out=$(cat $S/sig.out)
+  for i in $(seq 1 20); do kill -0 ${KID:-0} 2>/dev/null || break; sleep 0.1; done; }
+for k in TERM HUP; do
+  sig $k $S/hang.json
+  ok "SIG$k while checking a push → deny (exit 2, not $([ $k = TERM ] && echo 143 || echo 129))" "[ $rc = 2 ]"
+  ok "…with a one-line reason naming SIG$k" "[ \$(printf '%s\n' \"\$out\" | wc -l) -eq 1 ] && echo \"\$out\" | grep -q 'push-guard' && echo \"\$out\" | grep -q SIG$k"
+  ok "…and its hung checks are killed" "[ -n \"$KID\" ] && ! kill -0 $KID 2>/dev/null"
+  [ -n "$KID" ] && kill -9 $KID 2>/dev/null
+  sig $k $S/hang-ls.json
+  ok "SIG$k while checking ls → not denied (exit $rc)" "[ $rc != 2 ] && [ $rc != 0 ]"
+  [ -n "$KID" ] && kill -9 $KID 2>/dev/null
+done
+
+echo "-- input that isn't valid UTF-8 is still checked (the child never skips the checks on a decode error)"
+printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"git push -f origin main \xff"}}' > $S/bad-utf8.json
+out=$(hard python3 $H < $S/bad-utf8.json 2>&1); rc=$?
+ok "a force push with an invalid UTF-8 byte → deny (exit $rc)" "[ $rc = 2 ] && echo \"\$out\" | grep -qi force"
+printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"cmux send --workspace workspace:9 x \xff"}}' > $S/bad-utf8-cmux.json
+out=$(cd $S && ORCH_GUARD_CHILD=1 hard python3 $S/pg-import.py < $S/bad-utf8-cmux.json 2>&1); rc=$?
+ok "an import crash on invalid UTF-8 input naming cmux → deny (exit $rc)" "[ $rc = 2 ]"
+out=$(printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"git push -f origin main \xff"}}' | ORCH_GUARD_CHILD=1 hard python3 $H 2>&1); rc=$?
+ok "the checks child alone, same input → deny (exit $rc)" "[ $rc = 2 ]"
+
 echo "-- the deadline timer never fires inside subprocess (an exception there can leak Popen's waitpid lock: wait() hangs)"
 cat > $S/notimer.py <<'PY'
 import importlib.util, signal, subprocess, sys, time

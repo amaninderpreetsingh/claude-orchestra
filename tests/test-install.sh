@@ -350,6 +350,18 @@ if command -v node >/dev/null; then
   code(){ curl -s --path-as-is -o "$S/dbody" -w '%{http_code}' "http://127.0.0.1:$DP$1"; }
   ok "demo server serves index.html at /" '[ "$(code /)" = 200 ] && grep -q "Tip Calculator" "$S/dbody"'
   ok "demo server serves app.js" '[ "$(code /app.js)" = 200 ]'
+  ctype(){ curl -s --path-as-is -o /dev/null -w '%{content_type}' "http://127.0.0.1:$DP$1"; }
+  ok "/ is served as text/html (utf-8)" '[ "$(ctype /)" = "text/html; charset=utf-8" ]'
+  ok "/index.html is served as text/html" '[ "$(ctype /index.html)" = "text/html; charset=utf-8" ]'
+  ok "/app.js has a JavaScript Content-Type (module scripts need one)" '[ "$(ctype /app.js)" = "text/javascript; charset=utf-8" ]'
+  printf 'x' > "$S/demo1/app/a.css"; printf '{}' > "$S/demo1/app/a.json"; printf '<svg/>' > "$S/demo1/app/a.svg"; printf 'x' > "$S/demo1/app/a.mjs"; printf 'x' > "$S/demo1/app/a.bin"; printf 'x' > "$S/demo1/app/A.JS"
+  ok ".css → text/css" '[ "$(ctype /a.css)" = "text/css; charset=utf-8" ]'
+  ok ".json → application/json" '[ "$(ctype /a.json)" = "application/json; charset=utf-8" ]'
+  ok ".svg → image/svg+xml" '[ "$(ctype /a.svg)" = "image/svg+xml" ]'
+  ok ".mjs → text/javascript" '[ "$(ctype /a.mjs)" = "text/javascript; charset=utf-8" ]'
+  ok "an upper-case .JS is still JavaScript" '[ "$(ctype /A.JS)" = "text/javascript; charset=utf-8" ]'
+  ok "an unknown extension → application/octet-stream" '[ "$(ctype /a.bin)" = "application/octet-stream" ]'
+  ok "a 404 is plain text, not the extension's type" '[ "$(ctype /nope.js)" = "text/plain; charset=utf-8" ]'
   ok "a ../ request outside the app dir → 404" '[ "$(code /../outside.txt)" = 404 ] && ! grep -q secret "$S/dbody"'
   ok "a deep ../ request (/etc/passwd) → 404" '[ "$(code /../../../../../../../../etc/passwd)" = 404 ]'
   ok "an encoded %2e%2e request → 404" '[ "$(code /%2e%2e/outside.txt)" = 404 ] && [ "$(code /..%2foutside.txt)" = 404 ]'

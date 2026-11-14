@@ -50,26 +50,25 @@ jobs:
         run: gitleaks dir --no-banner --redact .
 
   python39:
-    # macOS's own /usr/bin/python3 (Command Line Tools) is 3.9, the floor install.sh accepts: every shipped Python
-    # file and the suites must run on it, not only on the runner's newer default python3
+    # macOS's own /usr/bin/python3 (Command Line Tools, 3.9 today) is the floor install.sh accepts and the interpreter
+    # the hook really runs on: every shipped Python file and the suites must run on it, not only on the runner's
+    # newer default python3. No setup-python: its 3.9 build isn't Apple's.
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - id: py
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
-        with:
-          python-version: "3.9"
-
-      - name: python3 is 3.9
+      - name: /usr/bin/python3 (Command Line Tools) is 3.9; make it python3 for the next steps
         run: |
-          python3 -c 'import sys; print(sys.executable, sys.version); sys.exit(sys.version_info[:2] != (3, 9))'
+          # fails when the runner image's CLT python isn't 3.9: the floor install.sh accepts would go untested
+          /usr/bin/python3 -c 'import sys; print(sys.executable, sys.version); sys.exit(sys.version_info[:2] != (3, 9))'
+          mkdir -p "$RUNNER_TEMP/clt-python" && ln -sf /usr/bin/python3 "$RUNNER_TEMP/clt-python/python3"
+          echo "$RUNNER_TEMP/clt-python" >> "$GITHUB_PATH"
 
-      - name: Lint (bash -n, python compile, JSON) on 3.9
-        run: bash scripts/lint.sh
+      - name: Lint (bash -n, python compile, JSON) on /usr/bin/python3
+        run: |
+          python3 -c 'import sys; print(sys.executable, sys.version)'
+          bash scripts/lint.sh
 
-      - name: Test suites on 3.9 (python3 shim first on PATH)
-        run: bash tests/run.sh
-        env:
-          ORCH_PYTHON: ${{ steps.py.outputs.python-path }}
+      - name: Test suites on /usr/bin/python3 (python3 shim first on PATH)
+        run: ORCH_PYTHON=/usr/bin/python3 bash tests/run.sh

@@ -804,12 +804,16 @@ def cmd_close(a):
     r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
     w = d / "workers" / f"{a.slice}.json"
     wk = read_json(w) or sys.exit(f"orch: no worker {a.slice}")
-    did, mb = cleanup_worker(r, wk, full=not a.keep_worktree)
-    if wk.get("status") == "active":
+    did, mb = cleanup_worker(r, wk)
+    if wk.get("status") in ("active", "dead"):  # dead too: reap cleans a dead worker's processes only, never its tree
         wk["status"] = a.status or "done"
-    wk.update(finished=now(), cleaned=now())
+    wk["finished"] = now()
+    done = cleanup_complete(r, wk, did)
+    if done:  # else reap retries what didn't finish (a pane close that timed out, a worktree git couldn't remove)
+        wk["cleaned"] = now()
     write_json(w, wk)
-    print(f"closed {wk['name']}: {', '.join(did) or 'nothing left running'}")
+    print(f"closed {wk['name']}: {', '.join(did) or 'nothing left running'}"
+          + ("" if done else " — not finished (pane or worktree left); the next orch reap retries it"))
 
 
 def sims_down(dry=False):
@@ -1027,10 +1031,19 @@ def cmd_reap(a):
                 continue  # cleaned once already (nothing to redo every heartbeat), or not done reporting yet
             else:
                 did, mb = cleanup_worker(r, wk, full=True, dry=a.dry_run, names=names)
-                # (a write when nothing was left would count as activity: see idle_secs)
-                if did and not a.dry_run and cleanup_complete(r, wk, did):
+                done = not a.dry_run and cleanup_complete(r, wk, did)
+                if done and did:
                     wk["cleaned"] = now()
                     write_json(w, wk)
+                elif done:
+                    # nothing was left: record it once, as of its last event, without counting as activity
+                    # (idle_secs reads these timestamps and the file's mtime); no event → retried, harmlessly
+                    last = max((wk[k] for k in ("started", "finished", "merged", "died") if ts(wk.get(k))),
+                               key=ts, default=None)
+                    if last:
+                        mtime = w.stat().st_mtime
+                        write_json(w, dict(wk, cleaned=last))
+                        os.utime(w, (mtime, mtime))
             if did:
                 lines.append(f"{wk['name']} ({wk.get('status')}): {', '.join(did)}")
                 total += mb
@@ -1088,11 +1101,16 @@ def cmd_end_run(a):
     for w, wk in workers_of(RUNS / a.run, status=None):
         did, mb = cleanup_worker(r, wk, full=True, names=names)
         total += mb
-        if wk.get("status") == "active":
+        if wk.get("status") in ("active", "dead"):  # dead too, so a retry cleans it in full
             wk["status"] = a.status
-        wk["cleaned"] = now()
+        done = cleanup_complete(r, wk, did)
+        if done:
+            wk["cleaned"] = now()
         write_json(w, wk)
-        if did:
+        if not done:
+            print(f"NOT finished {wk['name']}: {', '.join(did) or 'nothing'} tried, pane or worktree left — "
+                  f"retry with orch reap --run {a.run}")
+        elif did:
             print(f"cleaned {wk['name']}: {', '.join(did)}")
     integ = {"name": f"{a.run}-integrate", "ports": None}
     did, mb = cleanup_worker(r, integ, full=True, names=names)
@@ -1789,7 +1807,7 @@ def main():
     s = p.add_subparsers(dest="command", required=True)
     c = s.add_parser("new-run"); c.add_argument("--repo", default="."); c.add_argument("--title", required=True); c.add_argument("--coordinator"); c.add_argument("--coordinator-workspace")
     c = s.add_parser("spawn"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--resume", action="store_true"); c.add_argument("--all-mcp", action="store_true", help="give the worker every MCP server"); c.add_argument("--native", action="store_true", help="slice needs the iOS Simulator (keeps cmux Computer Use)"); c.add_argument("--dry-run", action="store_true", help="print what it would run; call neither cmux nor claude")
-    c = s.add_parser("close"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done"); c.add_argument("--keep-worktree", action="store_true")
+    c = s.add_parser("close"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done")
     c = s.add_parser("run-branch"); c.add_argument("--run", required=True)
     c = s.add_parser("baseline"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("--setup", help="e.g. 'npm ci'"); c.add_argument("--cmd", action="append", required=True)
     c = s.add_parser("add-worker"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--workspace", required=True)

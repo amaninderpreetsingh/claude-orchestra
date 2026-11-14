@@ -48,7 +48,8 @@ it); out of time inside a worker, under a tier record, or when it can't tell, a 
 A crash the fallback can't handle (import time included: a pattern this Python can't compile) never exits 1, which
 Claude Code ignores: any command naming push/commit/cmux/broadcast/verdict/criterion is denied (crash_deny). The
 checks run in a child process under a wall-clock limit (supervise: deadline + 5s), so even a hang the timer can't
-end (it fires once; a cleanup that then blocks, e.g. subprocess's waitpid lock) is killed and gets the same rule;
+end (it fires once; a cleanup that then blocks, e.g. subprocess's waitpid lock) is killed and gets the same rule,
+as do a SIGTERM/SIGHUP to the supervisor (a cancelled hook) and input that isn't UTF-8 (read with replacement);
 subprocess calls run with the timer paused (paused/resume) so it never interrupts their internals. The code
 runs on Python 3.9 (macOS's own python3); tests/run.sh with ORCH_PYTHON=/usr/bin/python3 checks it.
 
@@ -93,7 +94,7 @@ def crash_deny(why):
     the guard checks — a push, a commit, a cmux or orch evidence call. Plain string tests only. Returns otherwise."""
     if "raw" not in STDIN:
         try:
-            STDIN["raw"] = sys.stdin.read()
+            STDIN["raw"] = read_input()
         except Exception:
             STDIN["raw"] = None
     raw, text = STDIN["raw"], None
@@ -105,8 +106,17 @@ def crash_deny(why):
     text = raw if text is None else text  # input it can't read as a hook call: its raw text, or (none) everything
     flat = None if text is None else "".join(c for c in text.lower() if c not in "\"'\\")  # pu""sh, p\ush
     if flat is None or any(w in flat for w in GUARDED):
-        print(f"{' '.join(why.split())}; refusing a command it guards.", file=sys.stderr, flush=True)
-        os._exit(2)
+        os.write(2, f"{' '.join(why.split())}; refusing a command it guards.\n".encode("utf-8", "replace"))
+        os._exit(2)  # (a raw write: a signal handler may have interrupted a buffered one, and print would raise)
+
+
+def as_text(data):
+    """The hook input as text; bytes that aren't UTF-8 are replaced, never an error that skips the checks."""
+    return data.decode("utf-8", "replace")
+
+
+def read_input():
+    return as_text(sys.stdin.buffer.read())
 
 
 def _crashed(kind, e, tb):
@@ -139,9 +149,26 @@ def supervise():
     blocks (subprocess's waitpid lock left held by the interrupt) waits forever, and Claude Code runs the command when
     a hook times out. On expiry: kill the child's whole process group and apply crash_deny's rule. Never returns."""
     import signal, subprocess
+    proc = {}
+
+    def stopped(signum, _frame):  # Claude Code cancelling the hook: exit 143/129 would let the command run
+        name = signal.Signals(signum).name
+        try:
+            if proc.get("p"):
+                os.killpg(proc["p"].pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if proc.get("p") and proc["p"].poll() == 2:  # poll: an exited child isn't reaped (returncode) until then
+            os._exit(2)  # the checks already denied (on text crash_deny's plain test may miss): keep it denied
+        STDIN.setdefault("raw", None)  # stopped before its input was read: nothing to go by, deny
+        crash_deny(f"push-guard was stopped by {name}")
+        os.write(2, f"push-guard was stopped by {name}\n".encode())
+        os._exit(128 + signum)  # nothing guarded named: the usual exit for that signal
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stopped)
     try:
         data = sys.stdin.buffer.read()
-        STDIN["raw"] = data.decode("utf-8", "replace")
+        STDIN["raw"] = as_text(data)
     except Exception:
         data, STDIN["raw"] = b"", None
     if STDIN["raw"] is None:
@@ -151,6 +178,7 @@ def supervise():
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, **{CHILD: "1"}),
                              start_new_session=True)  # its own group: a kill reaches the git calls it started
+        proc["p"] = p
     except Exception as e:
         crash_deny(f"push-guard couldn't start its checks ({type(e).__name__}: {e})")
         print(f"push-guard couldn't start its checks ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
@@ -1437,7 +1465,7 @@ if __name__ == "__main__":
     data = {}
     arm(left())
     try:
-        STDIN["raw"] = sys.stdin.read()
+        STDIN["raw"] = read_input()
         data = json.loads(STDIN["raw"])
         main(data)
         disarm()

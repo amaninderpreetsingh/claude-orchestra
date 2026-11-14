@@ -27,18 +27,24 @@ EOF
 cat > server.js <<'EOF'
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { resolve, sep } from 'node:path';
+import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 3000);
+const utf8 = (t) => `${t}; charset=utf-8`;
+// Browsers refuse a module script without a JavaScript Content-Type, so every file gets its type.
+const types = { '.html': utf8('text/html'), '.js': utf8('text/javascript'), '.mjs': utf8('text/javascript'),
+  '.css': utf8('text/css'), '.json': utf8('application/json'), '.svg': 'image/svg+xml' };
 createServer(async (req, res) => {
   try {
     const path = decodeURIComponent(req.url.split('?')[0]);
     const file = resolve(root, '.' + (path === '/' ? '/index.html' : path));
     if (!file.startsWith(root.endsWith(sep) ? root : root + sep)) throw new Error('outside the app dir');
     if (file.slice(root.length).split(sep).some((p) => p.startsWith('.'))) throw new Error('dot path (.git, .env)');
-    res.end(await readFile(file));
-  } catch { res.statusCode = 404; res.end('not found'); }
+    const body = await readFile(file);
+    res.setHeader('Content-Type', types[extname(file).toLowerCase()] || 'application/octet-stream');
+    res.end(body);
+  } catch { res.statusCode = 404; res.setHeader('Content-Type', utf8('text/plain')); res.end('not found'); }
 }).listen(port, '127.0.0.1', () => console.log(`ready on http://127.0.0.1:${port}`));
 EOF
 cat > index.html <<'EOF'
