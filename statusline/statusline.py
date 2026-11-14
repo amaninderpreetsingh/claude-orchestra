@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """Claude Code status line: this chat's context %, plus 5-hour and weekly plan usage % with reset times."""
-import json, sys, time, pathlib
+import json, sys, time
 
-raw = sys.stdin.read()
-log = pathlib.Path.home() / ".claude/statusline/inputs"
 try:
-    d = json.loads(raw)
+    d = json.loads(sys.stdin.read())
 except Exception:
     print("statusline: bad input"); sys.exit(0)
-try:  # keep the latest raw input per session (for debugging which fields Claude Code sends)
-    log.mkdir(exist_ok=True)
-    (log / f"{d.get('session_id', 'unknown')}.json").write_text(raw)
-except Exception:
-    pass
 
 G, Y, R, DIM, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 

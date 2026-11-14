@@ -10,7 +10,7 @@ In any repo, open a cmux chat (`claude` in the repo) and type `/new-task <task>`
 5. **Integration** (multi-slice) — whole-feature review + verification on a run branch, then one push to main. Final report: what shipped, what deployed, evidence, what wasn't exercised. Workers' `## Learned` notes are folded into the repo's project memory and checked with `memory-lint`.
 
 ## New app
-`mkdir ~/Documents/GitHub/<name> && cd` there, run `claude` (accept the trust prompt), describe the app. It asks name, private/public and stack, creates the GitHub repo, builds a scaffold slice first (typecheck, lint, tests, build, Playwright, repo `CLAUDE.md`), then the features on top.
+Make an empty folder for the app and `cd` into it (e.g. `mkdir -p ~/code && mkdir ~/code/<name> && cd ~/code/<name>`; the second `mkdir` fails if the folder already exists), run `claude` (accept the trust prompt), describe the app. It asks name, private/public and stack, creates the GitHub repo, builds a scaffold slice first (typecheck, lint, tests, build, Playwright, repo `CLAUDE.md`), then the features on top.
 
 ## End-to-end test on a throwaway repo (nothing leaves your Mac)
 ```
@@ -28,7 +28,7 @@ Accept the folder-trust prompt once, then paste the suggested `/orchestrate …`
 | `orch doctor --run <run> [--fix]` | dead workers, orphan locks (+ respawn command) |
 | `orch locks --repo <path>` | who owns which files / the merge lock |
 | `orch criteria-check --run <run>` | acceptance criteria status |
-| `orch spawn --run <run> --slice <id> [--resume]` | open a worker workspace (coordinator uses this) |
+| `orch spawn --run <run> --slice <id> [--resume] [--native] [--all-mcp] [--dry-run]` | open a worker workspace (coordinator uses this); `--native` for an iOS Simulator slice (keeps cmux Computer Use), `--all-mcp` gives the worker every MCP server instead of only `worker-mcp.json`'s, `--dry-run` prints what it would run |
 | `orch close --run <run> --slice <id>` | close a worker workspace + worktree, free its locks/ports |
 | `orch reap [--run <run>] [--dry-run]` | kill/clean anything finished or dead still using memory (runs on every coordinator wake) |
 | `orch gc [--ended-older-than 14d] [--dry-run]` | runs that ended long ago keep only spec, HANDOFF, criteria, plan and run.json; the rest (artifacts, logs, watch state) is deleted |
@@ -39,10 +39,10 @@ Accept the folder-trust prompt once, then paste the suggested `/orchestrate …`
 State: `~/.claude/orchestra/runs/<run>/` (spec, criteria, briefs, progress, artifacts/screenshots).
 
 ## Guarantees (enforced by `hooks/push-guard.py`, not by prompts)
-- A worker can push only as one plain `git push origin HEAD:<its branch>`, only on top of the latest remote, only with gates + reviewer + verifier PASS recorded **on that exact commit**, and only holding the merge lock (taken in its own command). Force/delete pushes are always blocked.
+- A worker can push only as one plain `git push origin HEAD:<its branch>`, only on top of the latest remote, only with gates + reviewer + verifier PASS recorded **on that exact commit**, and only holding the merge lock (taken in its own command). Force/delete pushes are denied in every plain spelling (see the guard header's known limits).
 - Only the reviewer/verifier agents can record their own verdicts — workers can't self-certify.
 - Workers only send tagged reports/questions to their own coordinator; they can't message other workers or drive other terminals.
-- Outside a worker, the guard doesn't block a normal `git commit` / `git push` (it never auto-approves compound commands, so `git add -A && git commit …` prompts under conservative settings), except a change bound by `orch tier`: tier S pushes only with gates + a lite reviewer PASS on that commit, tier M/L never ships from a main checkout (a worker ships it; then `orch tier --clear`). Force/delete pushes are always denied.
+- Outside orchestra worktrees (a worker's, or the coordinator's integration worktree), the guard never approves anything: it only denies or stays silent, so your own permission rules decide a normal `git commit` / `git push` (under conservative settings they prompt), except a change bound by `orch tier`: tier S pushes only with gates + a lite reviewer PASS on that commit, tier M/L never ships from a main checkout (a worker ships it; then `orch tier --clear`). Force/delete pushes are denied in every plain spelling (see the guard header's known limits).
 
 ## Native + real-browser checks
 - Slices marked **native** need committed Maestro flows, run on each owner's own Simulator clone (`orch-sim`), so native verifications run in parallel. Recipe: the repo's own (e.g. a project memory file), else `orchestra/references/ios.md`.

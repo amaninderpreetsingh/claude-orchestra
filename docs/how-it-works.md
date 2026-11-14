@@ -36,10 +36,10 @@ Tier S skips all of this (one confirmation, edit, gates, lite review rounds, pus
 ## What push-guard enforces (`orchestra/hooks/push-guard.py`)
 
 A `PreToolUse` hook on every Bash command:
-- **In a worker worktree:** a push must be exactly `git push origin HEAD:<registered branch>`, on top of the latest remote, with gates-ok recorded for that HEAD (gates + reviewer + verifier PASS), holding the merge lock. A compound command containing a push is denied, and so is anything it can't parse exactly or any error: when unsure, it denies. Write the push as one plain command with the branch written out (no `cd`, variables or `$(…)`).
+- **In an orchestra worktree** (a worker's, or the coordinator's integration worktree): the only command it auto-approves is a push, exactly `git push origin HEAD:<registered branch>`, on top of the latest remote, with gates-ok recorded for that HEAD (gates + reviewer + verifier PASS), holding the merge lock; a commit there gets no decision (workers run in auto mode). A compound command containing a push is denied (only `cd <this worktree> && ` may come right before the exact push), and so is anything it can't parse exactly or any error: when unsure, it denies. Write the push as one plain command with the branch written out (no variables or `$(…)`).
 - **Messaging:** workers may only send tagged messages to their own coordinator and may not drive other cmux workspaces.
 - **Verdicts:** only the reviewer/verifier agents may record them.
-- **Outside workers:** plain commits and pushes are not blocked by the guard, except while a tier record (`orch tier`) binds an unshipped change; compound commands are never auto-approved, so your own permission rules decide. Force and delete pushes are always denied.
+- **Everywhere else:** the guard never approves anything. It only denies (for example force and delete pushes, a verdict written by the wrong agent, or a push while a tier record (`orch tier`) binds an unshipped change that fails its checks) or stays silent, so your own permission rules decide every other git command, plain pushes and commits included.
 
 Known limits are listed in the guard's header.
 
