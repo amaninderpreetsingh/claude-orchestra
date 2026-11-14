@@ -57,11 +57,11 @@ cd claude-orchestra
 ./install.sh
 ```
 
-It prints the dependency table first and stops (writing nothing) if a required tool is missing, cmux first. Then it asks three questions:
+It prints the dependency table first and stops (writing nothing) if a required tool is missing, cmux first. Then it asks up to three questions:
 
 1. **Will you build websites or web apps?** Yes adds the Playwright MCP server at user scope (`claude mcp add -s user playwright -- npx -y @playwright/mcp@latest …`, skipped if you already have one) and installs Playwright's browsers. Workers get the same server from `~/.claude/orchestra/worker-mcp.json`. It needs node/npx: without it the default answer is no, and yes (or `--web`) stops before anything is written.
 2. **Add the workflow rules to `~/.claude/CLAUDE.md`?** It appends [CLAUDE.template.md](CLAUDE.template.md) between `<!-- claude-orchestra:start -->` and `<!-- claude-orchestra:end -->`. Your own text is kept; a rerun replaces only that block.
-3. **Add `orch` to your PATH in your shell rc?** Default no: it prints the line instead. The skills call `orch` by full path, so this only matters if you want to type it yourself.
+3. **Add `orch` to your PATH in your shell rc?** Asked only for zsh or bash when `~/.claude/orchestra/bin` isn't on your PATH yet; other shells just get the line printed. Default no: it prints the line instead. The skills call `orch` by full path, so this only matters if you want to type it yourself.
 
 Then it copies `skills/`, `agents/`, `orchestra/` and `statusline/` into `~/.claude`, backing up every file it replaces to `~/.claude/backups/claude-orchestra-<timestamp>/`. It never overwrites `settings.json`: it merges in the push-guard hook, the status line (only if you have none) and the deny rules from [settings.example.json](settings.example.json). Last, it runs the test suites (a few minutes; `--skip-tests` skips them).
 
@@ -109,7 +109,7 @@ While it runs: answer the questions it asks (each comes with a recommended answe
 | tool | `make-demo-repo` | The throwaway demo above. |
 | hook | `orchestra/hooks/push-guard.py` | PreToolUse hook on Bash: enforces the push and messaging rules below. |
 | | `statusline/statusline.py` | Status line: context %, plus 5-hour and weekly usage with reset times. |
-| | `orchestra/worker-mcp.json` | The only MCP servers workers load (Playwright, context7), to save memory. |
+| | `orchestra/worker-mcp.json` | The only MCP servers workers load (Playwright, context7), to save memory; `orch spawn --native` skips it so iOS Simulator slices keep cmux Computer Use. |
 
 More on the commands: [orchestra/README.md](orchestra/README.md).
 
@@ -121,7 +121,7 @@ More on the commands: [orchestra/README.md](orchestra/README.md).
 - **Tiers bind the main checkout too.** An S change pushes only with gates + a lite reviewer PASS on that commit; an M/L change never ships from the main checkout.
 - **Never production.** The rules treat any resource as production unless proven otherwise and never write to anything matching `prod|production`; tests and verifiers use emulators and test accounts.
 - **Conservative settings.** `settings.example.json` adds no allow rules, no default permission mode and no model choice — only the hook, the status line and deny rules for the common spellings of a force-push and of `rm -rf /`, `~`, `$HOME`. The deny rules are a backstop that matches text; push-guard is what denies every force push, however it's written.
-- **Compound commands prompt.** push-guard does not auto-approve compound commands, so with these settings something like `git add -A && git commit -m …` asks for permission. Unattended runs need workers started in auto mode (`orch spawn` does this) or your own matching allow rules. A worker's push must be one plain command: a push combined with `&&`, `;`, `cd` or `$(…)` is denied.
+- **Compound commands prompt.** push-guard never auto-approves a compound command, so outside workers your own permission rules decide: with these settings something like `git add -A && git commit -m …` asks for permission. Unattended runs need workers started in auto mode (`orch spawn` does this) or your own matching allow rules. Inside a worker a compound command containing a push is denied, so a push must be one plain `git push origin HEAD:<target>` with the branch written out (no `cd`, variables or `$(…)`). Inside a worker, when unsure, the guard denies. Known limits are listed in the header of `orchestra/hooks/push-guard.py`.
 
 ## Token cost
 

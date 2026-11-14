@@ -5,7 +5,7 @@ The skills are the source of truth; this page is a map. Where they differ, the s
 ## Roles
 
 - **Coordinator** — your chat, running `new-task` / `orchestrate` in the repo's main checkout inside a cmux workspace. It plans, dispatches, answers workers, integrates and reports. It never writes feature code.
-- **Worker** — a separate `claude -w` session per slice, opened by `orch spawn` as its own cmux workspace in the coordinator's sidebar group, in its own git worktree (`<repo>/.claude/worktrees/<run>-<slice>`) with its own 10-port block (`$ORCH_PORT..$ORCH_PORT_END`). Workers start in auto permission mode with only the MCP servers in `orchestra/worker-mcp.json`.
+- **Worker** — a separate `claude -w` session per slice, opened by `orch spawn` as its own cmux workspace in the coordinator's sidebar group, in its own git worktree (`<repo>/.claude/worktrees/<run>-<slice>`) with its own 10-port block (`$ORCH_PORT..$ORCH_PORT_END`). Workers start in auto permission mode with only the MCP servers in `orchestra/worker-mcp.json`; `orch spawn --native` (Simulator slices) skips that file so the worker keeps cmux Computer Use.
 - **Subagents** — `reviewer`, `verifier`, `oracle`, `ci-monitor`, plus a general-purpose agent that runs `/code-review`. Each gets only the brief items, never the worker's reasoning.
 
 ## A run, phase by phase (`skills/orchestrate/SKILL.md`, `SUPERVISE.md`)
@@ -36,10 +36,12 @@ Tier S skips all of this (one confirmation, edit, gates, lite review rounds, pus
 ## What push-guard enforces (`orchestra/hooks/push-guard.py`)
 
 A `PreToolUse` hook on every Bash command:
-- **In a worker worktree:** a push must be exactly `git push origin HEAD:<registered branch>`, on top of the latest remote, with gates-ok recorded for that HEAD (gates + reviewer + verifier PASS), holding the merge lock. Anything it can't parse exactly, or any error, is denied. A command that mentions a push and uses `cd`, `$(…)`, variables or other shell indirection is denied — write it plainly.
+- **In a worker worktree:** a push must be exactly `git push origin HEAD:<registered branch>`, on top of the latest remote, with gates-ok recorded for that HEAD (gates + reviewer + verifier PASS), holding the merge lock. A compound command containing a push is denied, and so is anything it can't parse exactly or any error: when unsure, it denies. Write the push as one plain command with the branch written out (no `cd`, variables or `$(…)`).
 - **Messaging:** workers may only send tagged messages to their own coordinator and may not drive other cmux workspaces.
 - **Verdicts:** only the reviewer/verifier agents may record them.
 - **Outside workers:** plain commits and pushes are not blocked by the guard, except while a tier record (`orch tier`) binds an unshipped change; compound commands are never auto-approved, so your own permission rules decide. Force and delete pushes are always denied.
+
+Known limits are listed in the guard's header.
 
 ## State
 

@@ -1,6 +1,6 @@
 # claude-orchestra — contributor notes
 
-This repo is a public, generic Claude Code workflow. Its layout **mirrors `~/.claude`**: every file lives at the path it is installed to (`skills/<name>/`, `agents/<name>.md`, `orchestra/{bin,hooks,tests,references}/`, `statusline/`), so installing is a copy. Keep it that way — a new skill goes in `skills/<name>/SKILL.md`, never in a repo-only folder. Repo-only files: `scripts/`, `tests/`, `.github/`, `LICENSE`, `NOTICE`, this file, `README.md`.
+This repo is a public, generic Claude Code workflow. Its layout **mirrors `~/.claude`**: every file lives at the path it is installed to (`skills/<name>/`, `agents/<name>.md`, `orchestra/{bin,hooks,tests,references}/`, `statusline/`), so installing is a copy. Keep it that way — a new skill goes in `skills/<name>/SKILL.md`, never in a repo-only folder. Repo-only files: `install.sh`, `uninstall.sh`, `settings.example.json` (merged into `settings.json`, never copied), `CLAUDE.template.md` (the block appended to `~/.claude/CLAUDE.md`), `docs/`, `scripts/` (gates, `leak-patterns.txt`), `tests/` (`run.sh`, `test-gates.sh`, `test-install.sh`), `.github/`, `.gitignore`, `LICENSE`, `NOTICE`, this file, `README.md`.
 
 ## Gates (all must pass before a push; CI runs the same on macos-latest)
 ```
