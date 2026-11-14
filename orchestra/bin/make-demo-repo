@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 # Create a throwaway repo (with a local bare "origin", so pushes never leave your Mac)
-# for an end-to-end test of /orchestrate, then open it in a new cmux workspace.
-#   make-demo-repo [dir]     (default: ~/orchestra-demo)
+# for an end-to-end test of /orchestrate, then open it in a new cmux workspace running claude.
+#   make-demo-repo [--no-launch] [dir]     (default dir: ~/orchestra-demo)
+# --no-launch (or ORCH_NO_LAUNCH=1) only creates the repo; tests and verifiers must use it.
+# ORCH_CMUX overrides the cmux binary.
 set -euo pipefail
-DIR="${1:-$HOME/orchestra-demo}"
+LAUNCH=1; DIR=""
+for a in "$@"; do
+  case "$a" in
+    --no-launch) LAUNCH=0 ;;
+    -*) echo "make-demo-repo: unknown option $a" >&2; exit 2 ;;
+    *) [ -z "$DIR" ] || { echo "make-demo-repo: one dir only" >&2; exit 2; }; DIR="$a" ;;
+  esac
+done
+[ "${ORCH_NO_LAUNCH:-}" != 1 ] || LAUNCH=0
+CMUX="${ORCH_CMUX:-cmux}"
+DIR="${DIR:-$HOME/orchestra-demo}"
 if [ -e "$DIR" ]; then echo "$DIR exists — pass another path or remove it first" >&2; exit 1; fi
 mkdir -p "$DIR"; cd "$DIR"
 git init -q --bare -b main origin.git
@@ -37,8 +49,8 @@ EOF
 printf 'node_modules/\n' > .gitignore
 git add . && git commit -qm "chore: demo app skeleton" && git push -q origin main && git remote set-head origin main
 echo "Demo repo ready: $DIR/app"
-if command -v cmux >/dev/null; then
-  cmux new-workspace --name "orchestra-demo" --cwd "$DIR/app" --focus true --command "claude" >/dev/null 2>&1 \
+if [ "$LAUNCH" = 1 ] && command -v "$CMUX" >/dev/null; then
+  "$CMUX" new-workspace --name "orchestra-demo" --cwd "$DIR/app" --focus true --command "claude" >/dev/null 2>&1 \
     && echo "Opened a cmux workspace 'orchestra-demo' running claude (accept the folder-trust prompt once)."
 fi
 cat <<EOF

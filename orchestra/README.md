@@ -1,11 +1,11 @@
 # Orchestra — how to use it
 
 ## Everyday use
-In any repo, open a cmux chat (`claude` in the repo) and type `/new-task <task>`: it sizes the task S / M / L and spends tokens to match (S = one lite review, M = one worker, L = full orchestra). `/orchestrate <task>` (the L path) skips triage; `/orchestrate --resume <run>` continues a run from its `runs/<run>/HANDOFF.md`.
+In any repo, open a cmux chat (`claude` in the repo) and type `/new-task <task>`: it sizes the task S / M / L and spends tokens to match (S = an edit in the main checkout with lite review rounds, M = one worker, L = full orchestra). `/orchestrate <task>` (the L path) skips triage; `/orchestrate --resume <run>` continues a run from its `runs/<run>/HANDOFF.md`.
 
 1. **Interview** — it asks ranked questions with a recommended answer each ("yes" accepts), suggests better ideas, and logs every decision.
 2. **Spec** — EARS acceptance criteria, slices (file-owned, vertical, waves), deploy impact. You approve or change.
-3. **Workers** — everything stays in the coordinator's cmux workspace: up to 3 worker panes open beside it (first on the right, then stacked below), each a `claude -w` worktree with its own 10-port block (`$ORCH_PORT..$ORCH_PORT_END`). A finished worker's pane closes itself. They write tests first, run gates, get **reviewer + verifier PASS** (adversarial review too for risky slices), rebase, push.
+3. **Workers** — up to 3 at once, each its own cmux workspace in the coordinator's sidebar group (next to a live dashboard workspace), each a `claude -w` worktree with its own 10-port block (`$ORCH_PORT..$ORCH_PORT_END`). They write tests first, run gates, then **review rounds** (`skills/worker/SKILL.md` §4–5): each round a fresh `reviewer` + `/code-review` in parallel (plus an adversarial reviewer on risky slices), fix every blocking finding, re-gate, repeat until a round is clean; then the `verifier`. Same finding twice in a row → a question for you; cap 4 rounds → `oracle` → BLOCKED. Then rebase and push. The coordinator closes a finished worker's workspace (`orch close`).
 4. **Updates when something happens** — worker reports, `orch-watch` events (dead, stalled ≥15 min, usage limit hit/resumed), or a 30-min heartbeat (also on demand: ask "status"). Usage-limited sessions resume themselves after the reset; `caffeinate` keeps the Mac awake while a run is active. Pushes to repos with `.github/workflows` get one `ci-monitor` PASS/FAIL line.
 5. **Integration** (multi-slice) — whole-feature review + verification on a run branch, then one push to main. Final report: what shipped, what deployed, evidence, what wasn't exercised. Workers' `## Learned` notes are folded into the repo's project memory and checked with `memory-lint`.
 
@@ -15,6 +15,7 @@ In any repo, open a cmux chat (`claude` in the repo) and type `/new-task <task>`
 ## End-to-end test on a throwaway repo (nothing leaves your Mac)
 ```
 ~/.claude/orchestra/bin/make-demo-repo          # creates ~/orchestra-demo/app + opens it in cmux
+~/.claude/orchestra/bin/make-demo-repo --no-launch [dir]   # only creates the repo (tests, verifiers)
 ```
 Accept the folder-trust prompt once, then paste the suggested `/orchestrate …` task. Delete `~/orchestra-demo` afterwards.
 
@@ -27,20 +28,21 @@ Accept the folder-trust prompt once, then paste the suggested `/orchestrate …`
 | `orch doctor --run <run> [--fix]` | dead workers, orphan locks (+ respawn command) |
 | `orch locks --repo <path>` | who owns which files / the merge lock |
 | `orch criteria-check --run <run>` | acceptance criteria status |
-| `orch spawn --run <run> --slice <id> [--resume]` | open a worker pane (coordinator uses this) |
-| `orch close --run <run> --slice <id>` | close a worker pane + worktree, free its locks/ports |
+| `orch spawn --run <run> --slice <id> [--resume]` | open a worker workspace (coordinator uses this) |
+| `orch close --run <run> --slice <id>` | close a worker workspace + worktree, free its locks/ports |
 | `orch reap [--run <run>] [--dry-run]` | kill/clean anything finished or dead still using memory (runs on every coordinator wake) |
+| `orch gc [--ended-older-than 14d] [--dry-run]` | runs that ended long ago keep only spec, HANDOFF, criteria, plan and run.json; the rest (artifacts, logs, watch state) is deleted |
 | `orch-sim acquire\|release --owner <o>` | per-owner iOS Simulator clone (native slices) |
 | `memory-lint <memory dir>` | check a project memory dir (frontmatter, index, dups) |
-| `orch end-run --run <run> --status aborted` | abandon a run — tears down all its panes, processes, worktrees |
+| `orch end-run --run <run> --status aborted` | abandon a run — tears down all its workspaces, processes, worktrees |
 
 State: `~/.claude/orchestra/runs/<run>/` (spec, criteria, briefs, progress, artifacts/screenshots).
 
 ## Guarantees (enforced by `hooks/push-guard.py`, not by prompts)
-- A worker can push only to its registered branch, only on top of the latest remote, only with gates + reviewer + verifier PASS recorded **on that exact commit**, and only holding the merge lock. Force/delete pushes are always blocked.
+- A worker can push only as one plain `git push origin HEAD:<its branch>`, only on top of the latest remote, only with gates + reviewer + verifier PASS recorded **on that exact commit**, and only holding the merge lock (taken in its own command). Force/delete pushes are always blocked.
 - Only the reviewer/verifier agents can record their own verdicts — workers can't self-certify.
 - Workers only send tagged reports/questions to their own coordinator; they can't message other workers or drive other terminals.
-- Outside a worker, normal `git commit` / `git push` run without a prompt, except a change bound by `orch tier`: tier S pushes only with gates + a lite reviewer PASS on that commit, tier M/L never ships from a main checkout (a worker ships it; then `orch tier --clear`). Force/delete pushes are always denied.
+- Outside a worker, the guard doesn't block a normal `git commit` / `git push` (it never auto-approves compound commands, so `git add -A && git commit …` prompts under conservative settings), except a change bound by `orch tier`: tier S pushes only with gates + a lite reviewer PASS on that commit, tier M/L never ships from a main checkout (a worker ships it; then `orch tier --clear`). Force/delete pushes are always denied.
 
 ## Native + real-browser checks
 - Slices marked **native** need committed Maestro flows, run on each owner's own Simulator clone (`orch-sim`), so native verifications run in parallel. Recipe: the repo's own (e.g. a project memory file), else `orchestra/references/ios.md`.
@@ -50,4 +52,4 @@ State: `~/.claude/orchestra/runs/<run>/` (spec, criteria, briefs, progress, arti
 Console/web chores (store products, console settings, uploads) are not part of this repo: the coordinator does them itself at the right point in the run (with your own console-chores skill, if you have one), and owner-only steps (signatures, payments, final submit/publish) come back to you.
 
 ## Files
-`~/.claude/skills/orchestrate/` (coordinator) · `skills/worker/` · `agents/{reviewer,verifier,oracle,ci-monitor}.md` · `orchestra/bin/{orch,orch-watch,orch-sim,memory-lint}` · `orchestra/hooks/push-guard.py`
+`~/.claude/skills/new-task/` (front door) · `skills/orchestrate/` (coordinator) · `skills/worker/` · `skills/{diagnosing-bugs,retro,writing-for-agents}/` · `agents/{reviewer,verifier,oracle,ci-monitor}.md` · `orchestra/bin/{orch,orch-watch,orch-sim,memory-lint,make-demo-repo}` · `orchestra/hooks/push-guard.py` · `orchestra/worker-mcp.json` · `statusline/statusline.py`

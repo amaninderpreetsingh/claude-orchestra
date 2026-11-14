@@ -139,6 +139,8 @@ echo '{"a": 1,}' > "$S/r/bad.json"; LT
 ok "invalid JSON" '[ $rc = 1 ] && grep -q "FAIL bad.json" <<< "$out"'; rm "$S/r/bad.json"
 mkdir -p "$S/r/__pycache__"; echo 'def x(:' > "$S/r/__pycache__/ign.py"; echo "__pycache__/" > "$S/r/.gitignore"; LT
 ok "ignored files are skipped" '[ $rc = 0 ]'
+mkdir -p "$S/nogit"; printf 'if then fi\n' > "$S/nogit/bad.sh"; out=$(GIT_CEILING_DIRECTORIES="$S" bash "$ROOT/scripts/lint.sh" "$S/nogit" 2>&1); rc=$?
+ok "git ls-files failure exits non-zero" '[ $rc != 0 ] && grep -q "git ls-files failed" <<< "$out"'
 
 # ---------- run.sh ----------
 RS(){ out=$(bash "$ROOT/tests/run.sh" "$@" 2>&1); rc=$?; }

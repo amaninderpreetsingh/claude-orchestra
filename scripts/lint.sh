@@ -9,6 +9,8 @@ cd "$REPO" || exit 1
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-lint.XXXXXX"); trap 'rm -rf "$TMP"' EXIT
 F=0; SH=0; PY=0; JS=0
 fail(){ F=$((F + 1)); echo "FAIL $1"; sed 's/^/    /' "$TMP/err"; }
+# list first: a failing `git ls-files` (not a repo, broken index) must fail the gate, not lint nothing
+git ls-files -z --cached --others --exclude-standard > "$TMP/files" || { echo "lint: git ls-files failed in $REPO"; exit 1; }
 while IFS= read -r -d '' f; do
   [ -f "$f" ] || continue
   first=$(head -c 200 "$f" | head -1)
@@ -24,6 +26,6 @@ while IFS= read -r -d '' f; do
          '#!'*bash*|'#!'*/sh|'#!'*' sh') SH=$((SH + 1)); bash -n "$f" 2>"$TMP/err" || fail "$f (bash syntax)" ;;
        esac ;;
   esac
-done < <(git ls-files -z --cached --others --exclude-standard)
+done < "$TMP/files"
 echo "lint: $SH shell, $PY python, $JS json checked — $F failure(s)"
 [ $F -eq 0 ]
