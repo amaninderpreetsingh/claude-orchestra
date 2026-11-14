@@ -5,11 +5,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-guard-bypass.XXXXXX"); trap 'rm -rf "$S"' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
+hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
 P=0; F=0
 hook(){ # hook <cwd> <cmd> [agent_type] → hook output in $out, decision in $got
   out=$(python3 -c 'import json,sys;d={"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}
 if sys.argv[3]: d["agent_type"]=sys.argv[3]
-print(json.dumps(d))' "$1" "$2" "${3:-}" | python3 $H 2>&1); rc=$?
+print(json.dumps(d))' "$1" "$2" "${3:-}" | hard python3 $H 2>&1); rc=$?
   got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask; true; }
 expect(){ # expect <label> <want: allow|deny|silent> <cwd> <cmd> [agent_type]
   hook "$3" "$4" "${5:-}"
@@ -330,7 +331,7 @@ ok "worker cmux send, every git call slow → deny" "[ $got = deny ]"
 ok "…within the deadline (${el}s)" "[ $el -le 6 ]"
 t0=$(date +%s); SLOW=rev-parse ORCH_GUARD_DEADLINE=3 PATH=$S/slow:$PATH hook $S "ls"; el=$(( $(date +%s) - t0 ))
 ok "unrelated command, slow git → no decision" "[ $got = silent ]"
-fb(){ python3 -c '
+fb(){ hard python3 -c '
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("pg", sys.argv[1]); pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)
 try: pg.fallback({"tool_name": "Bash", "cwd": sys.argv[2], "tool_input": {"command": sys.argv[3]}}, RuntimeError("boom"))
@@ -341,5 +342,101 @@ out=$(fb $R "git commit -qm x" 2>&1); rc=$?
 ok "fallback, plain commit outside a worker → no decision, never allow" "[ $rc = 0 ] && ! echo \"\$out\" | grep -q allow"
 out=$(fb $R "git push -f origin main" 2>&1); rc=$?
 ok "fallback, force push outside a worker → still deny" "[ $rc = 2 ]"
+
+echo "-- a crash anywhere, import time included, fails closed (exit 2), never exit 1 (= the guard silently off)"
+python3 - "$H" "$S" <<'PY'
+import sys
+src, out = open(sys.argv[1]).read(), sys.argv[2]
+anchor, m, f = 'PUSH = re.compile(GIT + r"push\\b")', "def main(data):\n", "def fallback(data, e):\n"
+assert anchor in src and m in src and f in src
+# a pattern this Python can't compile (as (?>…) on 3.9): module level, before main runs
+open(out + "/pg-import.py", "w").write(src.replace(anchor, 're.compile("(")\n' + anchor, 1))
+# main and its fallback both crash at run time
+open(out + "/pg-run.py", "w").write(src.replace(m, m + '    raise RuntimeError("boom")\n', 1)
+                                       .replace(f, f + '    raise RuntimeError("fallback boom")\n', 1))
+PY
+mkdir -p $S/plain
+for k in import run; do
+  H=$S/pg-$k.py hook $S/plain "git push origin main"
+  ok "$k crash: plain push outside any worker → deny" "[ $got = deny ]"
+  ok "$k crash: …with a one-line reason" "[ \$(printf '%s\n' \"\$out\" | wc -l) -eq 1 ] && echo \"\$out\" | grep -q 'push-guard'"
+  H=$S/pg-$k.py hook $S/plain "cmux send --workspace workspace:9 x"
+  ok "$k crash: cmux command → deny" "[ $got = deny ]"
+  H=$S/pg-$k.py hook $S/plain "orch $V --role reviewer --verdict PASS"
+  ok "$k crash: orch evidence command → deny" "[ $got = deny ]"
+  H=$S/pg-$k.py hook $S/plain "git pu\"\"sh -f origin main"
+  ok "$k crash: a quoted push spelling → deny" "[ $got = deny ]"
+  H=$S/pg-$k.py hook $S/plain "git p\\ush --force origin main"
+  ok "$k crash: a backslash push spelling → deny" "[ $got = deny ]"
+  H=$S/pg-$k.py hook $S/plain "ls -la"
+  ok "$k crash: ls still passes (not denied)" "[ $got != deny ]"
+done
+out=$(printf 'not json: git push origin main' | python3 $S/pg-import.py 2>&1); rc=$?
+ok "import crash, unreadable input naming a push → deny" "[ $rc = 2 ]"
+out=$(printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"ls"}}' | python3 $S/pg-import.py 2>&1); rc=$?
+ok "import crash, ls → not denied (exit $rc)" "[ $rc != 2 ]"
+out=$(printf 'not json: git push -f origin main' | hard python3 $H 2>&1); rc=$?
+ok "input that isn't JSON, naming a push → deny (exit $rc)" "[ $rc = 2 ]"
+out=$(printf 'not json: ls' | hard python3 $H 2>&1); rc=$?
+ok "input that isn't JSON, naming nothing guarded → not denied (exit $rc)" "[ $rc != 2 ]"
+
+echo "-- a hang the deadline timer can't break (e.g. subprocess's leaked waitpid lock) still ends within the hard limit"
+python3 - "$H" "$S" <<'PY'
+import sys
+src, out = open(sys.argv[1]).read(), sys.argv[2]
+m = "def main(data):\n"
+assert m in src
+# as when the one-shot timer has already fired and the cleanup then blocks forever: no in-process timer can end it
+open(out + "/pg-hang.py", "w").write(src.replace(
+    m, m + "    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM}); time.sleep(3600)\n", 1))
+PY
+t0=$(date +%s); ORCH_GUARD_DEADLINE=3 H=$S/pg-hang.py hook $S/plain "git push origin main"; el=$(( $(date +%s) - t0 ))
+ok "hung checks: a push → deny" "[ $got = deny ]"
+ok "…within the hard limit, deadline + 5s (${el}s)" "[ $el -le 10 ]"
+ok "…with a one-line reason naming the limit" "[ \$(printf '%s\n' \"\$out\" | wc -l) -eq 1 ] && echo \"\$out\" | grep -q 'hard limit'"
+t0=$(date +%s); ORCH_GUARD_DEADLINE=3 H=$S/pg-hang.py hook $S/plain "cmux send --workspace workspace:9 x"; el=$(( $(date +%s) - t0 ))
+ok "hung checks: a cmux command → deny within the limit (${el}s)" "[ $got = deny ] && [ $el -le 10 ]"
+t0=$(date +%s); ORCH_GUARD_DEADLINE=3 H=$S/pg-hang.py hook $S/plain "ls -la"; el=$(( $(date +%s) - t0 ))
+ok "hung checks: ls → not denied, within the limit (${el}s)" "[ $got != deny ] && [ $el -le 10 ]"
+ok "the hung checks were killed (no python left running pg-hang.py)" "! pgrep -f '$S/pg-hang.py' >/dev/null"
+printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"git push origin main"}}' > $S/hang.json
+python3 $S/pg-hang.py < $S/hang.json >/dev/null 2>&1 & SUP=$!
+for i in $(seq 1 50); do KID=$(pgrep -P $SUP | head -1); [ -n "$KID" ] && break; sleep 0.1; done
+ok "(the supervisor started its checks in a child)" "[ -n \"$KID\" ]"
+kill -9 $SUP 2>/dev/null; wait $SUP 2>/dev/null
+for i in $(seq 1 20); do kill -0 ${KID:-0} 2>/dev/null || break; sleep 0.1; done
+ok "a hung child whose supervisor was killed (Claude Code's hook timeout) ends at once, never lingers" "! kill -0 ${KID:-0} 2>/dev/null"
+[ -n "$KID" ] && kill -9 $KID 2>/dev/null
+
+echo "-- the deadline timer never fires inside subprocess (an exception there can leak Popen's waitpid lock: wait() hangs)"
+cat > $S/notimer.py <<'PY'
+import importlib.util, signal, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("pg", sys.argv[1]); pg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pg)
+seen, real = [], subprocess.run
+def watching(*a, **k):
+    seen.append(signal.getitimer(signal.ITIMER_REAL)[0])
+    return real(*a, **k)
+subprocess.run = watching
+pg.arm(5); rc, out = pg.git("--version", cwd="."); left = signal.getitimer(signal.ITIMER_REAL)[0]; pg.disarm()
+print("ok   git runs with the timer paused" if seen == [0.0] and rc == 0 else "FAIL timer armed inside subprocess: %r" % seen)
+print("ok   …and re-armed after (%.1fs left)" % left if 3 < left <= 5 else "FAIL timer not restored: %r" % left)
+def slow(*a, **k):  # runs past the overall deadline without its own timeout firing
+    seen.append(signal.getitimer(signal.ITIMER_REAL)[0]); time.sleep(0.8)
+    return subprocess.CompletedProcess(a[0], 0, "", "")
+subprocess.run, seen[:] = slow, []
+pg.START = time.monotonic() - pg.DEADLINE + pg.PHASE["reserve"] + 0.4  # 0.4s left
+pg.arm(pg.left())
+try:
+    pg.git("status", cwd=".")
+    print("FAIL a git call past the deadline returned")
+except pg.Deadline:
+    print("ok   past the deadline, git raises Deadline after the call (synchronously)" if seen == [0.0]
+          else "FAIL timer armed inside subprocess: %r" % seen)
+pg.disarm()
+PY
+hard python3 $S/notimer.py $H > $S/notimer.out 2>&1; nrc=$?; cat $S/notimer.out
+[ $nrc = 0 ] || { F=$((F+1)); echo "FAIL notimer.py crashed (exit $nrc)"; }
+F=$((F + $(grep -c '^FAIL' $S/notimer.out))); P=$((P + $(grep -c '^ok' $S/notimer.out)))
 
 echo; echo "PASSED $P  FAILED $F"; [ $F = 0 ]

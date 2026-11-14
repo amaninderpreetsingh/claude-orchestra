@@ -17,6 +17,9 @@
 # A second run with the same answers changes nothing. ./uninstall.sh reverses it (from the manifest at
 # ~/.claude/orchestra/.install-manifest.json). ORCH_CMUX overrides the cmux binary (tests).
 set -euo pipefail
+# macOS's own python3 (3.9) caches bytecode under ~/Library/Caches/com.apple.python on every run: nothing is written
+# before the checks pass, not even that
+export PYTHONDONTWRITEBYTECODE=1
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.claude"
 BIN_DIR="$DEST/orchestra/bin"
@@ -65,8 +68,18 @@ MISSING=()
 echo "Dependencies"
 row NAME KIND STATUS
 if has "$CMUX"; then row cmux required found; else row cmux required "missing — brew install --cask cmux"; MISSING+=(cmux); fi
+PYBAD=""
 if has python3 && PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3, 9))' 2>/dev/null); then
-  row python3 required "found $PYV"
+  # smoke test: each hook (push-guard.py) must load with this interpreter: one that can't would fail closed on every
+  # push/commit/cmux command in every repo (or, for a hook without that guard, be silently off)
+  for hook in "$SRC"/orchestra/hooks/*.py; do
+    [ -f "$hook" ] || continue
+    if ! err=$(python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location("hook", sys.argv[1]); s.loader.exec_module(u.module_from_spec(s))' \
+        "$hook" 2>&1 < /dev/null); then
+      err=$(printf '%s\n' "$err" | tail -1); PYBAD="$(basename "$hook") fails to load with $(command -v python3) (Python $PYV): ${err:-exit non-zero}"; break
+    fi
+  done
+  if [ -z "$PYBAD" ]; then row python3 required "found $PYV"; else row python3 required "found $PYV, but ${PYBAD%% with *}"; fi
 else row python3 required "missing or older than 3.9 — brew install python"; MISSING+=(python3); fi
 for t in git gh gitleaks claude; do
   case $t in git) h="xcode-select --install" ;; gh) h="brew install gh" ;; gitleaks) h="brew install gitleaks" ;;
@@ -94,6 +107,11 @@ cmux is required: every worker runs in its own cmux workspace, and the coordinat
 EOF
   fi
   echo "install.sh: missing required: ${MISSING[*]} — install them (hints above) and rerun. Nothing was written." >&2
+  exit 1
+fi
+if [ -n "$PYBAD" ]; then
+  echo "install.sh: $PYBAD" >&2
+  echo "install.sh: with it, every push, commit and cmux command would be denied. Use a python3 it loads with (brew install python) first on PATH, and rerun. Nothing was written." >&2
   exit 1
 fi
 # ---------- 2. questions (before anything is written) ----------

@@ -3,7 +3,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Scenario tests for orch-sim (per-owner simulator clones). Stubbed xcrun on PATH; a real-simctl
 # pass is opt-in (ORCH_SIM_REAL=1): other suites' `orch end-run` can shut sims down mid-test.
 set -u
-S=${TMPDIR:-/tmp}/orchestra-test-sim; rm -rf $S; mkdir -p $S/bin; cd $S
+S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-sim.XXXXXX"); trap 'rm -rf "$S"' EXIT; mkdir -p $S/bin; cd $S  # unique: suites run concurrently
 export ORCH_HOME=$S/home; SIM=$ROOT/bin/orch-sim
 PASS=0; FAIL=0
 check(){ if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "ok   $1"; else FAIL=$((FAIL+1)); echo "FAIL $1: want '$3' got '$2'"; fi; }

@@ -39,6 +39,20 @@ ok "exits 1" '[ $rc = 1 ]'
 ok "explains how to install cmux" 'grep -q "brew install --cask cmux" <<< "$out"'
 ok "nothing written under HOME" '[ "$(snap "$H")" = "$before" ]'
 
+echo "-- push-guard.py doesn't load with the found python3: explain, exit 1, write nothing"
+mkdir -p "$S/srcpy"; for f in install.sh uninstall.sh settings.example.json CLAUDE.template.md skills agents orchestra statusline; do cp -R "$ROOT/$f" "$S/srcpy/"; done
+python3 - "$S/srcpy/orchestra/hooks/push-guard.py" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read(); a = "\nimport codecs, re,"
+assert a in s
+open(p, "w").write(s.replace(a, '\nraise SyntaxError("needs a newer Python")' + a, 1))  # as (?>…) failed on 3.9
+PY
+H="$S/hpy"; newhome "$H"; before=$(snap "$H")
+out=$(cd "$S" && HOME="$H" PATH="$S/bin:$PATH" bash "$S/srcpy/install.sh" --yes --no-web --skip-tests < /dev/null 2>&1); rc=$?
+ok "exits 1" '[ $rc = 1 ]'
+ok "says push-guard.py fails to load with that python3" 'grep -q "push-guard.py fails to load" <<< "$out" && grep -q "needs a newer Python" <<< "$out"'
+ok "nothing written under HOME" '[ "$(snap "$H")" = "$before" ]'
+
 echo "-- invalid settings.json: exit 1, write nothing"
 H="$S/h0b"; newhome "$H"; echo '{ nope' > "$H/.claude/settings.json"; before=$(snap "$H")
 INST --yes --no-web --skip-tests
@@ -328,6 +342,24 @@ rm -f "$S/cmux.log"
 out=$(cd "$S" && ORCH_CMUX="$S/bin/cmux" bash "$ROOT/orchestra/bin/make-demo-repo" --no-launch "$S/demo1" 2>&1); rc=$?
 ok "demo repo created" '[ $rc = 0 ] && [ -f "$S/demo1/app/package.json" ] && [ -d "$S/demo1/origin.git" ]'
 ok "no cmux call with --no-launch" '[ ! -e "$S/cmux.log" ]'
+echo "-- the demo dev server serves only its app dir, on loopback only"
+if command -v node >/dev/null; then
+  DP=$((40000 + $$ % 2000 * 10)); echo secret > "$S/demo1/outside.txt"
+  (cd "$S/demo1/app" && PORT=$DP exec node server.js >/dev/null 2>&1) & DS=$!
+  for i in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$DP/" && break; sleep 0.1; done
+  code(){ curl -s --path-as-is -o "$S/dbody" -w '%{http_code}' "http://127.0.0.1:$DP$1"; }
+  ok "demo server serves index.html at /" '[ "$(code /)" = 200 ] && grep -q "Tip Calculator" "$S/dbody"'
+  ok "demo server serves app.js" '[ "$(code /app.js)" = 200 ]'
+  ok "a ../ request outside the app dir → 404" '[ "$(code /../outside.txt)" = 404 ] && ! grep -q secret "$S/dbody"'
+  ok "a deep ../ request (/etc/passwd) → 404" '[ "$(code /../../../../../../../../etc/passwd)" = 404 ]'
+  ok "an encoded %2e%2e request → 404" '[ "$(code /%2e%2e/outside.txt)" = 404 ] && [ "$(code /..%2foutside.txt)" = 404 ]'
+  ok "a missing file → 404" '[ "$(code /nope.js)" = 404 ]'
+  ok "the clone's .git (and any dot path) → 404" '[ "$(code /.git/config)" = 404 ] && [ "$(code /.gitignore)" = 404 ] && [ "$(code /%2egit/HEAD)" = 404 ]'
+  ok "it listens on 127.0.0.1 only (not every interface)" '[ "$(lsof -nP -a -p $DS -iTCP -sTCP:LISTEN -Fn | grep "^n")" = "n127.0.0.1:$DP" ]'
+  kill $DS 2>/dev/null; wait $DS 2>/dev/null
+else
+  echo "test-install: node missing, demo server not exercised"
+fi
 out=$(cd "$S" && ORCH_NO_LAUNCH=0 ORCH_CMUX="$S/bin/cmux" bash "$ROOT/orchestra/bin/make-demo-repo" "$S/demo4" 2>&1); rc=$?
 ok "ORCH_NO_LAUNCH=0 still launches" '[ $rc = 0 ] && grep -q "new-workspace" "$S/cmux.log"'; rm -f "$S/cmux.log"
 out=$(cd "$S" && ORCH_CMUX="$S/bin/cmux" bash "$ROOT/orchestra/bin/make-demo-repo" "$S/demo3" --no-launch 2>&1); rc=$?

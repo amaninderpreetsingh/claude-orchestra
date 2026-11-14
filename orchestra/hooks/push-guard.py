@@ -45,6 +45,12 @@ message, orch --summary, a cmux report) isn't a call — except where RUNS_ARGS 
 Deadline: Claude Code runs the command when a hook times out (settings.json gives it 60s) or python3 is missing, so
 python3 is required and the guard keeps its own clock: about 45s overall (ORCH_GUARD_DEADLINE may lower it, never raise
 it); out of time inside a worker, under a tier record, or when it can't tell, a push or a worker's cmux call is denied.
+A crash the fallback can't handle (import time included: a pattern this Python can't compile) never exits 1, which
+Claude Code ignores: any command naming push/commit/cmux/broadcast/verdict/criterion is denied (crash_deny). The
+checks run in a child process under a wall-clock limit (supervise: deadline + 5s), so even a hang the timer can't
+end (it fires once; a cleanup that then blocks, e.g. subprocess's waitpid lock) is killed and gets the same rule;
+subprocess calls run with the timer paused (paused/resume) so it never interrupts their internals. The code
+runs on Python 3.9 (macOS's own python3); tests/run.sh with ORCH_PYTHON=/usr/bin/python3 checks it.
 
 Known limits of the parser (deliberate bypasses by a hostile local agent; out of scope, not fixed): a cd target it
 can't know ($d from a loop or set earlier in the same command, xargs-built), env -C <dir>, zsh-only cd/pushd flags
@@ -73,14 +79,126 @@ can run shell can rewrite orchestra-tier.json. Documented limits: `orch tier --s
 M/L as S) replaces an unshipped record without checking what it still binds; a copy kept only in the reflog, a raw
 sha, a stash or a patch isn't scanned by `orch tier --clear`; remote-tracking refs are trusted as last fetched.
 """
-import codecs, json, os, re, shlex, signal, subprocess, sys, time
+import json, os, sys
+
+# Fail closed on a crash: Claude Code treats exit 1 as a non-blocking hook error, so a crash that escapes (at import
+# time too, e.g. a pattern this Python can't compile) would switch every check off. Installed before anything that
+# can fail; the checks' own errors go through fallback() first (see the end of this file).
+GUARDED = ("push", "commit", "cmux", "broadcast", "verdict", "criterion")  # what the guard checks, as plain text
+STDIN = {}  # the hook input as read
+
+
+def crash_deny(why):
+    """Last resort when the checks can't run at all: deny (exit 2, one line) any command whose text names something
+    the guard checks — a push, a commit, a cmux or orch evidence call. Plain string tests only. Returns otherwise."""
+    if "raw" not in STDIN:
+        try:
+            STDIN["raw"] = sys.stdin.read()
+        except Exception:
+            STDIN["raw"] = None
+    raw, text = STDIN["raw"], None
+    try:
+        text = json.loads(raw)["tool_input"]["command"]
+        text = text if isinstance(text, str) else None
+    except Exception:
+        pass
+    text = raw if text is None else text  # input it can't read as a hook call: its raw text, or (none) everything
+    flat = None if text is None else "".join(c for c in text.lower() if c not in "\"'\\")  # pu""sh, p\ush
+    if flat is None or any(w in flat for w in GUARDED):
+        print(f"{' '.join(why.split())}; refusing a command it guards.", file=sys.stderr, flush=True)
+        os._exit(2)
+
+
+def _crashed(kind, e, tb):
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    except Exception:
+        pass
+    try:
+        crash_deny(f"push-guard crashed ({kind.__name__}: {e})")
+    except BaseException:
+        os._exit(2)  # even the last resort failed: when unsure, deny
+    sys.__excepthook__(kind, e, tb)  # nothing guarded named: the usual non-blocking hook error (exit 1)
+
+
+def deadline():
+    """The overall budget in seconds; tests lower it, nothing raises it past the hook's own 60s timeout."""
+    try:
+        return max(1.0, min(45.0, float(os.environ.get("ORCH_GUARD_DEADLINE") or 45)))
+    except ValueError:
+        return 45.0
+
+
+CHILD = "ORCH_GUARD_CHILD"  # set in the child that runs the checks
+HARD_MARGIN = 5.0  # the supervisor's wall clock: deadline + this, still under Claude Code's 60s hook timeout
+
+
+def supervise():
+    """Run the checks in a child process and wait for it at most deadline() + HARD_MARGIN seconds by the wall clock.
+    The in-process deadline (SIGALRM) can't end every hang: once its one-shot timer has fired, a cleanup that then
+    blocks (subprocess's waitpid lock left held by the interrupt) waits forever, and Claude Code runs the command when
+    a hook times out. On expiry: kill the child's whole process group and apply crash_deny's rule. Never returns."""
+    import signal, subprocess
+    try:
+        data = sys.stdin.buffer.read()
+        STDIN["raw"] = data.decode("utf-8", "replace")
+    except Exception:
+        data, STDIN["raw"] = b"", None
+    if STDIN["raw"] is None:
+        crash_deny("push-guard couldn't read its input")  # denies: nothing to go by
+    limit = deadline() + HARD_MARGIN
+    try:
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, **{CHILD: "1"}),
+                             start_new_session=True)  # its own group: a kill reaches the git calls it started
+    except Exception as e:
+        crash_deny(f"push-guard couldn't start its checks ({type(e).__name__}: {e})")
+        print(f"push-guard couldn't start its checks ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
+        os._exit(1)
+    try:
+        out, err = p.communicate(data, timeout=limit)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        crash_deny(f"push-guard's checks ran past its {limit:g}s hard limit")
+        print(f"push-guard's checks ran past its {limit:g}s hard limit (killed)", file=sys.stderr, flush=True)
+        os._exit(1)  # nothing guarded named: the non-blocking hook error
+    sys.stdout.buffer.write(out); sys.stdout.flush()
+    sys.stderr.buffer.write(err); sys.stderr.flush()
+    if p.returncode in (0, 1, 2):
+        os._exit(p.returncode)
+    crash_deny(f"push-guard's checks died (exit {p.returncode})")
+    os._exit(1)
+
+
+def orphan_watch():
+    """In the child (its own process group): end the group (itself and its git calls) once the supervisor is gone
+    (killed by Claude Code's hook timeout) or the hard limit has passed, so a hung child never lingers."""
+    import signal, threading, time
+    ppid, end = os.getppid(), time.monotonic() + deadline() + HARD_MARGIN
+
+    def watch():
+        while os.getppid() == ppid and time.monotonic() < end:
+            time.sleep(0.25)
+        if os.getpgrp() == os.getpid():  # its own group (supervise starts it so): never a caller's group
+            os.killpg(os.getpid(), signal.SIGKILL)
+        os.kill(os.getpid(), signal.SIGKILL)
+    threading.Thread(target=watch, daemon=True).start()
+
+
+if __name__ == "__main__":
+    sys.excepthook = _crashed
+    if os.environ.pop(CHILD, None) != "1":
+        supervise()
+    orphan_watch()
+
+import codecs, re, shlex, signal, subprocess, time
 from pathlib import Path
 
 ORCH_HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
-try:  # the overall budget; tests lower it, nothing raises it past the hook's own 60s timeout
-    DEADLINE = max(1.0, min(45.0, float(os.environ.get("ORCH_GUARD_DEADLINE") or 45)))
-except ValueError:
-    DEADLINE = 45.0
+DEADLINE = deadline()
 START, RESERVE = time.monotonic(), DEADLINE / 6  # the checks get DEADLINE - RESERVE, the fail-closed fallback the rest
 PHASE = {"reserve": RESERVE}
 
@@ -108,11 +226,30 @@ def arm(seconds):
 def disarm():
     if hasattr(signal, "setitimer"):
         signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def paused():
+    """Stop the timer; returns what resume() needs. A Deadline raised inside subprocess's internals can leave
+    Popen's waitpid lock held, and the cleanup's wait() then blocks forever: subprocess calls run with the timer
+    off and their own timeout."""
+    return (signal.setitimer(signal.ITIMER_REAL, 0)[0] if hasattr(signal, "setitimer") else 0.0), time.monotonic()
+
+
+def resume(state):
+    """Restart the timer stopped by paused() with what is left, or raise Deadline here (synchronously) if none is."""
+    rem, t0 = state
+    if rem > 0:
+        rem -= time.monotonic() - t0
+        if rem <= 0:
+            raise Deadline()
+        signal.setitimer(signal.ITIMER_REAL, rem)
 # `git` (bare, by path, after a separator/space/quote), its global options (group g), then the verb
 VAL = r"""(?:"[^"]*"|'[^']*'|[^\s;&|"'])+"""
 REDIR = rf"(?:\d*|&)(?:>>|>&|>\||>|<)[ \t]*{VAL}"  # a redirection may sit before the verb: git 2>/dev/null push
-GIT = (r"(?:^|(?<=[\s;&|(`'\"/\\]))git[\"']?(?P<g>(?>(?:[ \t]+(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--config-env|--attr-source|--super-prefix)"
-       rf"(?:[ \t]+|=){VAL}|--?[A-Za-z][\w-]*(?:={VAL})?|{REDIR}))*))[ \t]+")  # atomic: an option value is never the verb
+# group g is atomic (an option value is never the verb): (?=(?P<g>X))(?P=g) matches what X matches greedily and never
+# backtracks into it — the same as (?>X), which needs Python 3.11 (the hook must run on macOS's python3 3.9)
+GIT = (r"(?:^|(?<=[\s;&|(`'\"/\\]))git[\"']?(?=(?P<g>(?:[ \t]+(?:(?:-C|-c|--git-dir|--work-tree|--namespace|--config-env|--attr-source|--super-prefix)"
+       rf"(?:[ \t]+|=){VAL}|--?[A-Za-z][\w-]*(?:={VAL})?|{REDIR}))*))(?P=g)[ \t]+")
 PUSH = re.compile(GIT + r"push\b")
 COMMIT = re.compile(GIT + r"commit\b")
 OTHER_REPO = re.compile(r"\bGIT_(?:DIR|WORK_TREE|NAMESPACE|CONFIG\w*)=")
@@ -254,10 +391,13 @@ def git(*args, cwd):
     budget = min(30.0, left())
     if budget <= 0:
         raise Deadline()
+    state = paused()
     try:
         r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=budget)
     except subprocess.TimeoutExpired:
         raise Deadline() from None
+    finally:
+        resume(state)
     return r.returncode, r.stdout.strip()
 
 
@@ -669,7 +809,15 @@ def read(p, default):
 
 VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 # long options git also accepts abbreviated (--mirr); any prefix of these, or extension of them, is force/delete
-FORCE_LONG = ("force", "force-with-lease", "force-if-includes", "mirror", "delete", "all", "branches", "tags", "prune")
+FORCE_LONG = ("force", "force-with-lease", "force-if-includes", "mirror", "delete", "prune")
+# not force: outside workers they get no decision; a worker's exact form and a tier record's check deny them
+ALL_REFS_LONG = ("all", "branches", "tags")
+
+
+def long_opt(t, names):
+    """t is one of these long options, abbreviated (git accepts any unique prefix) or extended."""
+    name = t[2:].split("=", 1)[0] if t.startswith("--") else ""
+    return bool(name) and any(f.startswith(name) or name.startswith(f) for f in names)
 
 
 def worker_push(target):
@@ -680,8 +828,7 @@ def worker_push(target):
 def is_force(t):
     """A force/delete/mirror flag (any cluster with f or d before -o's value), or a + / :dst refspec."""
     if t.startswith("--"):
-        name = t[2:].split("=", 1)[0]
-        return bool(name) and any(f.startswith(name) or name.startswith(f) for f in FORCE_LONG)
+        return long_opt(t, FORCE_LONG)
     if t.startswith("-"):
         flags = t[1:].split("o", 1)[0]
         return "f" in flags or "d" in flags
@@ -763,7 +910,7 @@ def active_tier(cwd):
     return TIERS[common]
 
 
-def check_tier(cwd, gitdir, pos):
+def check_tier(cwd, gitdir, pos, opts=()):
     """`orch tier --set S|M|L` binds the committed change (its sha + the files its unpushed commits touch; one record
     per repo, in the git common dir) until it ships: its sha is an ancestor of the target, or a target commit holds its
     content for all those files (see shipped()), or `orch tier --clear` drops it (refused while HEAD or a local branch
@@ -779,6 +926,9 @@ def check_tier(cwd, gitdir, pos):
     if not tier:
         return
     t = tier["tier"]
+    if any(long_opt(o, ALL_REFS_LONG) for o in opts):
+        decide("deny", f"Tier {t} is recorded; --all/--branches/--tags send refs it doesn't check. "
+                       f"Push an explicit branch (or tag) by name.")
     toks = pos[1:]
     explicit = [s.split(":", 1)[0] or "HEAD" for s in toks if s != ":"]
     implied = []
@@ -960,7 +1110,7 @@ def check_push(data, cmd, m, exact=False):  # exact: main's whole-command match;
                            "expansion); run it plainly: git push origin <branch>")
         return "none", "push outside an orchestra worker that push-guard can't parse exactly: the user's rules apply"
     if owner is None:
-        check_tier(cwd, gitdir, pos)
+        check_tier(cwd, gitdir, pos, opts)
         return "none", "push outside an orchestra worker (tier record checked if any): the user's rules apply"
     target = owner["target"]
 
@@ -1287,19 +1437,23 @@ if __name__ == "__main__":
     data = {}
     arm(left())
     try:
-        data = json.load(sys.stdin)
+        STDIN["raw"] = sys.stdin.read()
+        data = json.loads(STDIN["raw"])
         main(data)
         disarm()
     except SystemExit:
         raise
     except Exception as e:
+        if not isinstance(data, dict) or not data:  # input it couldn't read as a hook call: only its raw text is left
+            disarm()
+            crash_deny(f"push-guard couldn't read its input ({type(e).__name__}: {e})")
         try:
             fallback(data, e)
         except SystemExit:
             raise
-        except BaseException:  # even the fallback ran out of time: deny anything it guards
-            c = str(((data if isinstance(data, dict) else {}).get("tool_input") or {}).get("command", ""))
-            if re.search(r"push|commit|cmux|broadcast|verdict|criterion", c, re.I):
-                decide("deny", f"push-guard ran past its {DEADLINE:g}s deadline; refusing a command it guards.")
+        except BaseException as e2:  # even the fallback crashed or ran out of time: deny anything it guards
+            disarm()
+            crash_deny(f"push-guard ran past its {DEADLINE:g}s deadline" if isinstance(e2, Deadline)
+                       else f"push-guard's fallback crashed ({type(e2).__name__}: {e2})")
 
 

@@ -4,6 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
+hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
 export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
 # fakes on PATH: caffeinate logs its pid and idles; cmux (spawn tests only) logs args, answers from $S/groups.json
 mkdir -p $S/stub $S/cmuxstub; export CAFF_LOG=$S/caff.log CMUX_LOG=$S/cmux.log
@@ -24,7 +25,7 @@ printf '#!/bin/sh\nexit 0\n' > $S/stub/pgrep                                    
 chmod +x $S/stub/caffeinate $S/stub/xcrun $S/stub/osascript $S/stub/pgrep $S/cmuxstub/cmux; export PATH=$S/stub:$PATH
 PASS=0; FAIL=0
 expect(){ # expect <label> <want: allow|ask|deny|silent> <cwd> <cmd>
-  out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$3\",\"tool_input\":{\"command\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$4")}}" | python3 $H 2>&1); rc=$?
+  out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$3\",\"tool_input\":{\"command\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$4")}}" | hard python3 $H 2>&1); rc=$?
   got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask
   if [ $got = $2 ]; then PASS=$((PASS+1)); echo "ok   $1"; else FAIL=$((FAIL+1)); echo "FAIL $1: want $2 got $got :: $out"; fi; }
 ok(){ if "$@" >/dev/null 2>&1; then PASS=$((PASS+1)); echo "ok   cmd: ${*:2:3}"; else FAIL=$((FAIL+1)); echo "FAIL cmd should succeed: $*"; "$@"; fi; }

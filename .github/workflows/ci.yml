@@ -48,3 +48,28 @@ jobs:
 
       - name: gitleaks (working tree)
         run: gitleaks dir --no-banner --redact .
+
+  python39:
+    # macOS's own /usr/bin/python3 (Command Line Tools) is 3.9, the floor install.sh accepts: every shipped Python
+    # file and the suites must run on it, not only on the runner's newer default python3
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - id: py
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.9"
+
+      - name: python3 is 3.9
+        run: |
+          python3 -c 'import sys; print(sys.executable, sys.version); sys.exit(sys.version_info[:2] != (3, 9))'
+
+      - name: Lint (bash -n, python compile, JSON) on 3.9
+        run: bash scripts/lint.sh
+
+      - name: Test suites on 3.9 (python3 shim first on PATH)
+        run: bash tests/run.sh
+        env:
+          ORCH_PYTHON: ${{ steps.py.outputs.python-path }}

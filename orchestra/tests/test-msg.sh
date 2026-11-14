@@ -3,13 +3,14 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-msg.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
+hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
 export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block, so this suite's allocations never collide with another's
 mkdir -p $S/stub; for x in caffeinate xcrun osascript; do printf '#!/bin/sh\nexit 0\n' > $S/stub/$x; chmod +x $S/stub/$x; done; export PATH=$S/stub:$PATH  # never the real caffeinate/simulators
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo; echo a>a; git add .; git commit -qm i; git push -q origin main; git remote set-head origin main
 RUN=$($O new-run --repo . --title m --coordinator workspace:7); git worktree add -q .claude/worktrees/w -b w origin/main; W=$S/repo/.claude/worktrees/w
 $O register --worktree $W --run $RUN --slice s >/dev/null
 P=0; F=0
-t(){ out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$1" "$2" | python3 $H 2>&1); r=$?; [ $r = $3 ] && { P=$((P+1)); echo "ok   $4"; } || { F=$((F+1)); echo "FAIL $4 (got $r) $out"; }; }
+t(){ out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$1" "$2" | hard python3 $H 2>&1); r=$?; [ $r = $3 ] && { P=$((P+1)); echo "ok   $4"; } || { F=$((F+1)); echo "FAIL $4 (got $r) $out"; }; }
 t $W 'cmux agent message workspace:7 --from x "PROGRESS: step 3 gates green"' 0 "tagged report to own coordinator"
 t $W 'cmux agent message workspace:7 --from x -- "QUESTION: which copy?"' 0 "question with -- separator"
 t $W 'cmux agent message workspace:7 "please merge my branch now"' 2 "untagged instruction to coordinator"

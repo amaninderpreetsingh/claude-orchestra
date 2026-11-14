@@ -17,9 +17,12 @@ def reset(ts):
     if not ts:
         return ""
     if isinstance(ts, str):  # ISO 8601
+        import re
         from datetime import datetime
+        # Python 3.9's fromisoformat reads only 0, 3 or 6 fraction digits: pad/cut them to 6
+        iso = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], ts.replace("Z", "+00:00"), count=1)
         try:
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            ts = datetime.fromisoformat(iso).timestamp()
         except ValueError:
             return ""
     left = ts - time.time()

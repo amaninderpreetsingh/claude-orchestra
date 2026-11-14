@@ -6,6 +6,8 @@
 # CMUX_*/ORCH_*/CLAUDE*/GIT_* variables, and stubs FIRST on PATH: `cmux` (a test must never reach the
 # real one — it would open real workspaces) plus `caffeinate`, `xcrun`, `osascript` (no real
 # sleep blockers, simulators or UI scripting). A suite may still put its own stubs before these.
+# ORCH_PYTHON=<interpreter> (e.g. /usr/bin/python3, macOS's 3.9) runs every suite with that interpreter as `python3`:
+# a shim first on PATH, so `python3 …`, `#!/usr/bin/env python3` scripts and hooks all resolve to it.
 # A suite fails if it exits non-zero, prints any `FAIL` line, or prints no `ok` line at all.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,6 +22,14 @@ fi
 [ ${#SUITES[@]} -gt 0 ] || { echo "run.sh: no suites found"; exit 1; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-run.XXXXXX"); trap 'rm -rf "$TMP"' EXIT
+PYSHIM=""
+if [ -n "${ORCH_PYTHON:-}" ]; then
+  PY=$(command -v "$ORCH_PYTHON") || { echo "run.sh: ORCH_PYTHON=$ORCH_PYTHON not found"; exit 1; }
+  case "$PY" in /*) ;; *) PY="$PWD/$PY" ;; esac  # each suite runs in its own dir: a relative path wouldn't resolve
+  mkdir -p "$TMP/pyshim"; printf '#!/bin/bash\nexec %q "$@"\n' "$PY" > "$TMP/pyshim/python3"; chmod +x "$TMP/pyshim/python3"
+  PYSHIM="$TMP/pyshim:"
+fi
+echo "run.sh: python3 = $(PATH="$PYSHIM$PATH" python3 -c 'import sys; print(sys.executable, "%d.%d.%d" % sys.version_info[:3])')"
 FAILED=(); TP=0; TF=0
 printf '%-28s %6s %6s  %s\n' SUITE PASS FAIL RESULT
 for suite in "${SUITES[@]}"; do
@@ -34,8 +44,8 @@ for suite in "${SUITES[@]}"; do
   printf '[user]\n\tname = orchestra-test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n' > "$box/home/.gitconfig"
   ( cd "$box" || exit 1
     for v in $(env | grep -oE '^(CMUX|ORCH|CLAUDE|GIT_)[A-Za-z0-9_]*=' | tr -d =); do unset "$v"; done
-    exec env HOME="$box/home" ORCH_HOME="$box/orch" PATH="$box/bin:$PATH" \
-      GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME="$box/home/.config" bash "$suite" ) > "$box/out.log" 2>&1
+    exec env HOME="$box/home" ORCH_HOME="$box/orch" PATH="$box/bin:$PYSHIM$PATH" \
+      GIT_CONFIG_NOSYSTEM=1 PYTHONDONTWRITEBYTECODE=1 XDG_CONFIG_HOME="$box/home/.config" bash "$suite" ) > "$box/out.log" 2>&1
   rc=$?
   p=$(grep -cE '^ok ' "$box/out.log"); f=$(grep -cE '^FAIL' "$box/out.log")
   TP=$((TP + p)); TF=$((TF + f))

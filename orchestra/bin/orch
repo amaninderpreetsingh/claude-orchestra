@@ -754,9 +754,10 @@ def cleanup_worker(r, wk, full=True, dry=False, names=None):
     live = cmux_live_workspaces()
     did = []
     ports = tuple(wk["ports"]) if wk.get("ports") else None
-    if ports:  # a finished worker's block may since have been handed to a new worker: never sweep someone else's ports
+    if ports:  # sweep the block only while this worker still holds it: once released (or handed to someone else)
+        # an unrelated process may listen there; orphan_listeners' tie-to-a-run rule covers a released block
         holder = (read_json(LOCKS / "ports" / str(ports[0]) / "owner.json") or {}).get("owner")
-        if holder and holder != name:
+        if holder != name:
             ports = None
     others = {f"/tmp/{o}" for o in (owner_names() if names is None else names) if o != name}
     tmp = dict(paths=(wt,), prefixes=(f"/tmp/{name}",), others=others)
@@ -973,6 +974,37 @@ def orphan_listeners(dry=False):
     return out
 
 
+MERGED_GRACE_SECS = 10 * 60  # `orch merged` comes before the worker's merge-unlock and MERGED report
+
+
+def still_merging(r, wk):
+    """A merged worker that may still be finishing its own steps (unlock, MERGED report): merged within the grace
+    period, or still holding the repo's merge lock (until that lock would be stale anyway)."""
+    if wk.get("status") != "merged":
+        return False
+    age = time.time() - (ts(wk.get("merged")) or 0)
+    if age < MERGED_GRACE_SECS:
+        return True
+    if age >= MERGE_LOCK_MAX_SECS:
+        return False
+    try:
+        holder = (read_json(merge_dir(r["repo"]) / "owner.json") or {}).get("owner")
+    except (Exception, SystemExit):  # can't tell who holds it: leave the worker alone this time
+        return True
+    return holder == wk.get("name")
+
+
+def cleanup_complete(r, wk, did):
+    """A full cleanup really finished: the worktree is gone and a pane it closed is no longer live (a close that timed
+    out, or a worktree git couldn't remove, is retried by the next reap)."""
+    if Path(f"{r['repo']}/.claude/worktrees/{wk['name']}").exists():
+        return False
+    if "pane" in did:
+        live = cmux_live_workspaces()
+        return live is not None and wk.get("workspace") not in live
+    return True
+
+
 def cmd_reap(a):
     """Clean up anything finished/dead that is still using memory. Safe to run any time (the 30-min heartbeat does)."""
     runs = [RUNS / a.run] if a.run else [RUNS / r["id"] for r in active_runs() if r.get("id")]
@@ -991,9 +1023,12 @@ def cmd_reap(a):
                 continue
             if wk.get("status") == "dead":
                 did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run, names=names)
+            elif wk.get("cleaned") or still_merging(r, wk):
+                continue  # cleaned once already (nothing to redo every heartbeat), or not done reporting yet
             else:
                 did, mb = cleanup_worker(r, wk, full=True, dry=a.dry_run, names=names)
-                if did and not a.dry_run:
+                # (a write when nothing was left would count as activity: see idle_secs)
+                if did and not a.dry_run and cleanup_complete(r, wk, did):
                     wk["cleaned"] = now()
                     write_json(w, wk)
             if did:

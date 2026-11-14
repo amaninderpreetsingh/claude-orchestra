@@ -9,6 +9,7 @@
 # Kept: run state (~/.claude/orchestra/runs …), ~/.claude/backups, and the Playwright MCP server
 # (remove it with `claude mcp remove -s user playwright`).
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # macOS's own python3 would cache bytecode under ~/Library/Caches (a refusal writes nothing)
 DEST="$HOME/.claude"
 YES=0
 for a in "$@"; do

@@ -18,6 +18,7 @@ down(){ for i in $(seq 1 30); do nc -z 127.0.0.1 $1 2>/dev/null || return 0; sle
 serve(){ # serve <dir> <port> → $SP: a plain http.server running in <dir>
   (cd "$1" && exec python3 -m http.server $2 --bind 127.0.0.1 >/dev/null 2>&1) & SP=$!; PIDS+=($SP); up $2; }
 reap(){ $O reap --keep-sim >/dev/null 2>&1; }
+reapout(){ $O reap --keep-sim --dry-run 2>&1; }
 alive(){ kill -0 $1 2>/dev/null; }
 
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo
@@ -90,6 +91,48 @@ ok "closing api leaves api-docs's /tmp dir" '[ -d /tmp/$R-api-docs-dd ]'
 ok "closing api leaves coordinator job api-e2e's process and /tmp dir" 'alive $KAE && [ -d /tmp/$R-api-e2e-cache ]'
 ok "closing api removes /tmp/<run>-api-dd" '[ ! -e /tmp/$R-api-dd ]'
 kill $K10 $K10T $KAD $KAE $K1 $K1T $K1A $K1C 2>/dev/null; wait $K10 $K10T $KAD $KAE $K1 $K1T $K1A $K1C 2>/dev/null
+
+echo "-- a finished worker's port block: swept only while it still holds it"
+read HA HB < <($O ports --run $R --name S4)   # handed to S4, still held (taken first: the released one stays free)
+read RA RB < <($O ports --run $R --name S3); $O ports --run $R --name S3 --release >/dev/null   # handed to S3, released
+echo '{"run":"'$R'","slice":"S3","name":"'$R-S3'","status":"done","ports":['$RA','$RB']}' > $D/workers/S3.json
+ok "(the two blocks differ)" '[ $RA != $HA ]'
+echo '{"run":"'$R'","slice":"S4","name":"'$R-S4'","status":"done","ports":['$HA','$HB']}' > $D/workers/S4.json
+serve $S/elsewhere $RA; U1=$SP
+serve $S/elsewhere $HA; U2=$SP
+reap
+ok "an unrelated listener on a finished worker's released block survives reap" 'alive $U1 && up $RA'
+ok "a listener on a block the finished worker still holds is swept" 'down $HA'
+ok "…and the held block is released" '[ ! -e $ORCH_HOME/locks/ports/$HA ]'
+kill $U1 $U2 2>/dev/null; wait $U1 $U2 2>/dev/null
+
+echo "-- a just-merged worker is left alone until it is done reporting; a cleaned one is skipped"
+ago(){ python3 -c 'import time,sys;print(time.strftime("%Y-%m-%dT%H:%M:%S",time.localtime(time.time()-float(sys.argv[1]))))' "$1"; }
+mk(){ echo '{"run":"'$R'","slice":"'$1'","name":"'$R-$1'","status":"merged","merged":"'"$(ago $2)"'"'"${3:-}"'}' > $D/workers/$1.json
+  if [ "${4:-}" = plain ]; then mkdir -p $WT/$R-$1; else git -C $REPO worktree add -q --detach $WT/$R-$1; fi
+  hold $WT/$R-$1/node_modules/.bin/vite; }
+mk M1 30; M1P=$HP                                # merged 30 s ago: still between `orch merged` and its report
+mk M2 900; M2P=$HP                               # merged 15 min ago, lock released: cleaned
+mk M3 900; M3P=$HP; $O merge-lock --repo $S/repo --owner $R-M3 --wait 0 >/dev/null 2>&1   # 15 min ago, still holds the lock
+mk M4 900 ',"cleaned":"'"$(ago 600)"'"'; M4P=$HP   # already cleaned once
+mk M5 900 "" plain; M5P=$HP                      # its worktree can't be removed (not a git worktree): cleanup fails
+sleep 0.3
+reap
+ok "a worker merged seconds ago keeps its processes (it hasn't reported yet)" 'alive $M1P'
+ok "…and isn't marked cleaned" '! grep -q cleaned $D/workers/M1.json'
+ok "a worker merged 15 min ago that released the merge lock is cleaned" '! alive $M2P && grep -q cleaned $D/workers/M2.json'
+ok "a merged worker still holding the merge lock keeps its processes" 'alive $M3P && ! grep -q cleaned $D/workers/M3.json'
+ok "a worker already marked cleaned is skipped" 'alive $M4P'
+ok "a cleanup that left the worktree behind isn't marked cleaned" '[ -d $WT/$R-M5 ] && ! grep -q cleaned $D/workers/M5.json'
+$O merge-unlock --repo $S/repo --owner $R-M3 >/dev/null 2>&1
+reap
+ok "…so the next reap retries it" '! grep -q cleaned $D/workers/M5.json && grep -q "$R-M5" <<< "$(reapout)"'
+ok "once it released the lock, it is cleaned" '! alive $M3P && grep -q cleaned $D/workers/M3.json'
+c1=$(grep -o '"cleaned": *"[^"]*"' $D/workers/M2.json)
+reap
+ok "a cleaned worker isn't cleaned again (its cleaned time is unchanged)" '[ "$(grep -o "\"cleaned\": *\"[^\"]*\"" $D/workers/M2.json)" = "$c1" ]'
+kill $M1P $M2P $M3P $M4P $M5P 2>/dev/null; wait $M1P $M2P $M3P $M4P $M5P 2>/dev/null
+rm -f $D/workers/M?.json
 
 echo "-- no active run (only the orphan rule applies: no finished worker is cleaned)"
 read EA EB < <($O ports --run $R --name job3)

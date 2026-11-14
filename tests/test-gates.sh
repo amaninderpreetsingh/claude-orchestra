@@ -173,6 +173,23 @@ out=$(CMUX_SOCKET_PATH=/x/sock ORCH_PORT=1 CLAUDE_FAKE=1 GIT_DIR=/x/.git GIT_CON
 ok "suite runs isolated: stubs first, own HOME/ORCH_HOME, env scrubbed" '[ $rc = 0 ] && grep -qE "^env.sh +10 +0  ok" <<< "$out"'
 RS "$S/suites/silent.sh"
 ok "suite with no ok lines fails" '[ $rc = 1 ] && grep -q "FAILED (no ok lines)" <<< "$out"'
+# ORCH_PYTHON: a fake interpreter (logs each call, then runs the real one) must serve python3 calls and shebangs
+REALPY=$(python3 -c 'import sys; print(sys.executable)')
+printf '#!/bin/sh\necho "$*" >> "%s/fakepy.log"\nexec "%s" "$@"\n' "$S" "$REALPY" > "$S/fakepy"; chmod +x "$S/fakepy"
+printf '#!/usr/bin/env python3\nprint("ok   shebang script ran")\n' > "$S/pyscript"; chmod +x "$S/pyscript"
+printf '#!/usr/bin/env bash\npython3 -c "print(\\"ok   python3 call\\")"\n"%s"\n' "$S/pyscript" > "$S/suites/py.sh"
+rm -f "$S/fakepy.log"; out=$(ORCH_PYTHON="$S/fakepy" bash "$ROOT/tests/run.sh" "$S/suites/py.sh" 2>&1); rc=$?
+ok "ORCH_PYTHON serves python3 calls and python3 shebangs" '[ $rc = 0 ] && grep -qE "^py.sh +2 +0  ok" <<< "$out" && grep -q "print(\"ok   python3 call\")" "$S/fakepy.log" && grep -q pyscript "$S/fakepy.log"'
+ok "…and run.sh names the interpreter" 'grep -q "^run.sh: python3 = " <<< "$out"'
+mkdir -p "$S/py \$dir \"q"; cp "$S/fakepy" "$S/py \$dir \"q/fakepy"; rm -f "$S/fakepy.log"
+out=$(cd "$S" && ORCH_PYTHON='./py $dir "q/fakepy' bash "$ROOT/tests/run.sh" "$S/suites/py.sh" 2>&1); rc=$?
+ok "a relative ORCH_PYTHON with a space, \$ and \" in its path works from every suite's own dir" '[ $rc = 0 ] && grep -qE "^py.sh +2 +0  ok" <<< "$out" && grep -q pyscript "$S/fakepy.log"'
+mkdir -p "$S/mod"; echo 'X = 1' > "$S/mod/m.py"
+printf '#!/usr/bin/env bash\npython3 -c "import sys; sys.path.insert(0, \\"%s\\"); import m; print(\\"ok   imported\\")"\n' "$S/mod" > "$S/suites/pyc.sh"
+RS "$S/suites/pyc.sh"
+ok "suites write no bytecode into the trees they import from" '[ $rc = 0 ] && [ ! -e "$S/mod/__pycache__" ]'
+out=$(ORCH_PYTHON="$S/no-such-python" bash "$ROOT/tests/run.sh" "$S/suites/pass.sh" 2>&1); rc=$?
+ok "a missing ORCH_PYTHON fails the run" '[ $rc = 1 ] && grep -q "ORCH_PYTHON=.*not found" <<< "$out"'
 out=$(cd "$S" && bash "$ROOT/tests/run.sh" suites/pass.sh 2>&1); rc=$?
 ok "relative suite path works" '[ $rc = 0 ] && grep -qE "^pass.sh +2 +0  ok" <<< "$out"'
 RS "$S/suites/nope.sh"

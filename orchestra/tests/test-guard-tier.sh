@@ -4,9 +4,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-guard-tier.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
+hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
 P=0; F=0
 expect(){ # expect <label> <want: allow|deny|silent; silent = exit 0, no output> <cwd> <cmd> [agent_type]
-  out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"agent_type":sys.argv[3],"tool_input":{"command":sys.argv[2]}}))' "$3" "$4" "${5:-}" | python3 $H 2>&1); rc=$?
+  out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"agent_type":sys.argv[3],"tool_input":{"command":sys.argv[2]}}))' "$3" "$4" "${5:-}" | hard python3 $H 2>&1); rc=$?
   got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask
   if [ $got = $2 ]; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1: want $2 got $got :: $out"; fi; }
 ok(){ if eval "$2" >/dev/null 2>&1; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1"; fi; }
@@ -51,7 +52,7 @@ echo d > a.txt; git commit -qam d
 expect "tier S already on origin → next push behaves as today" silent $R "$PUSH"
 ok "tier M recorded" "$O tier --set M --repo $R"
 expect "tier M on the pushed commit → main-checkout push denied" deny $R "$PUSH"
-out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":"git push origin main"}}))' $R | python3 $H 2>&1)
+out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":"git push origin main"}}))' $R | hard python3 $H 2>&1)
 ok "M deny names the worker path and --replace" "echo '$out' | grep -q 'orch spawn' && echo '$out' | grep -q -- '--replace'"
 ok "tier L recorded" "$O tier --set L --repo $R"
 expect "tier L on the pushed commit → denied" deny $R "$PUSH"
@@ -177,7 +178,7 @@ git commit -q --amend -m bp2; git checkout -q main; echo bq > c.txt; git add c.t
 expect "default push.default: bare push sends only HEAD → no decision" silent $R "git push"
 git config push.default matching
 expect "matching: bare push would send amended S on fix → deny" deny $R "git push"
-out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":"git push origin"}}))' $R | python3 $H 2>&1)
+out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":"git push origin"}}))' $R | hard python3 $H 2>&1)
 echo "$out" > $S/bare.msg
 ok "bare-push deny names the branch and the explicit-refspec fix" "grep -q refs/heads/fix $S/bare.msg && grep -q 'explicit refspec' $S/bare.msg"
 expect "explicit main refspec unaffected" silent $R "$PUSH"

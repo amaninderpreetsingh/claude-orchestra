@@ -4,9 +4,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-guard-parse.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
+hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
 P=0; F=0
 expect(){ # expect <label> <want: allow|ask|deny|silent> <cwd> <cmd>
-  out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$3" "$4" | python3 $H 2>&1); rc=$?
+  out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$3" "$4" | hard python3 $H 2>&1); rc=$?
   got=silent; { [ $rc != 0 ] || [ -n "$out" ]; } && got=noisy; [ $rc = 2 ] && got=deny; echo "$out" | grep -q '"allow"' && got=allow; echo "$out" | grep -q '"ask"' && got=ask
   if [ $got = $2 ]; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1: want $2 got $got :: $out"; fi; }
 ok(){ if eval "$2" >/dev/null 2>&1; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1"; fi; }
@@ -63,6 +64,15 @@ expect "redirection + unknown option before the verb → no decision" silent $R 
 expect "every unknown-option push is force-checked" deny $R "git --frob v push origin main; git --frob v push -f origin main"
 expect "-c include.path → deny" deny $R "git -c include.path=/tmp/m push origin"
 expect "the ':' matching refspec isn't a delete" silent $R "git push origin :"
+expect "--tags outside workers isn't force → no decision (user's rules)" silent $R "git push --tags origin"
+expect "push then --tags, chained → no decision" silent $R "git push origin main && git push --tags"
+expect "--all outside workers → no decision" silent $R "git push --all origin"
+expect "--branches outside workers → no decision" silent $R "git push origin --branches"
+expect "abbreviated --tag outside workers → no decision" silent $R "git push --tag origin"
+expect "--tags with --force → still deny" deny $R "git push --tags --force origin"
+expect "--all with --prune → still deny" deny $R "git push --all --prune origin"
+expect "--tags with --delete → still deny" deny $R "git push --tags --delete origin v1"
+expect "--mirror stays force → deny" deny $R "git push --mirror origin"
 
 echo "-- main checkout: quoted text given to grep/rg/echo is data; anything else stays a push"
 expect "grep for the text git push → silent" silent $R "grep -rn \"git push\" ."
@@ -111,6 +121,9 @@ expect "tier S, continued push → deny" deny $R "git push origin main ${BS}  -q
 expect "tier S, unparseable push → deny (not ask, not allow)" deny $R "git push origin \$BR"
 expect "tier S, unknown option before push → deny" deny $R "git --frob val push origin main"
 expect "tier S, grep for push text → silent" silent $R "grep -rn \"git push\" ."
+expect "tier S, --tags (refs it can't check) → deny" deny $R "git push --tags origin"
+expect "tier S, --all → deny" deny $R "git push --all origin"
+expect "tier S, abbreviated --bra → deny" deny $R "git push origin --bra"
 
 rm -f $R/.git/orchestra-tier.json  # main checkout pushes as today from here on
 echo "-- registered worker with gates-ok + merge lock: exactly origin HEAD:<target>"
@@ -158,6 +171,10 @@ expect "--no-pager before push recognised → deny force" deny $W "git --no-page
 expect "--repo overrides the remote → deny" deny $W "git push --repo=elsewhere origin HEAD:$T"
 expect "--receive-pack → deny" deny $W "git push --receive-pack=x origin HEAD:$T"
 expect "unknown option → deny" deny $W "git push --frobnicate origin HEAD:$T"
+expect "worker --tags → deny (only the one exact form)" deny $W "git push --tags origin HEAD:$T"
+expect "worker --all → deny" deny $W "git push --all origin"
+expect "worker --branches → deny" deny $W "git push origin --branches"
+expect "outside a worker session, -C into the worker with --tags → deny (no options in a worker push)" deny $S "git -C $W push --tags origin HEAD:$T"
 expect "unbalanced quote → deny" deny $W "git push origin \"HEAD:$T"
 expect "shell expansion → deny" deny $W "git push origin HEAD:\$T"
 expect "remote other than origin → deny" deny $W "git push upstream HEAD:$T"
@@ -219,5 +236,38 @@ expect "worker leading cd + env prefix → deny" deny $W "cd $W && GIT_SSH_COMMA
 expect "worker plain commit → no decision (user's rules)" silent $W "git commit -qm x"
 expect "worker session commit in another checkout → no decision, never allow" silent $W "cd $R && git commit -qm x"
 expect "worker session commit chained with rm elsewhere → no decision, never allow" silent $W "cd $R && git commit -qm x && rm -rf build"
+
+echo "-- the git-verb pattern runs on Python 3.9 and keeps its atomic options group"
+cat > $S/atomic.py <<'PY'
+import importlib.util, random, re, sys
+spec = importlib.util.spec_from_file_location("guard", sys.argv[1]); g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)  # module level compiles every pattern: a 3.11-only construct fails right here
+def m(pat, s):
+    x = pat.search(s)
+    return x and (x.span(), x.group("g"))
+# expected values are literals: an option value is never taken as the verb, a redirection before the verb is read
+fixed = [("git push origin main", ((0, 8), "")), ("git -C push push", ((0, 16), " -C push")),
+         ("git -c x=push status", None), ("git --git-dir=push log", None), ("git 2>/dev/null push -f", ((0, 20), " 2>/dev/null")),
+         ("echo; git --no-pager -c a=b push", ((6, 32), " --no-pager -c a=b")), ("git -C 'a push' fetch", None),
+         ("x/git push", ((2, 10), ""))]
+bad = [s for s, want in fixed if m(g.PUSH, s) != want]
+print(("FAIL fixed PUSH matches: %r" % bad) if bad else "ok   fixed PUSH matches (option values are never the verb)")
+if sys.version_info >= (3, 11):  # differential check against the (?>…) form the hook used before
+    old = re.compile(g.GIT.replace("(?=(?P<g>", "(?P<g>(?>").replace("))(?P=g)", "))") + r"push\b")
+    toks = ["git", "push", "commit", "-C", "-c", "--git-dir", "--git-dir=", "=", "x", "push=1", "'a b'", '"push"',
+            "2>", ">/dev/null", "2>&1", "&", ";", "|", " ", "\t", "-", "--no-pager", "/", "(", "-Cpush"]
+    rnd, diff = random.Random(7), []
+    for _ in range(20000):
+        s = "".join(rnd.choice(toks) + rnd.choice(["", " ", " ", "\t"]) for _ in range(rnd.randint(1, 9)))
+        if m(g.PUSH, s) != m(old, s):
+            diff.append(s)
+    print(("FAIL lookahead form differs from (?>…) on %d strings, e.g. %r" % (len(diff), diff[:3])) if diff
+          else "ok   lookahead form matches the (?>…) form on 20000 random commands")
+else:
+    print("ok   (differential check vs (?>…) needs Python 3.11+; skipped on %d.%d)" % sys.version_info[:2])
+PY
+python3 $S/atomic.py $H > $S/atomic.out 2>&1; arc=$?; cat $S/atomic.out
+[ $arc = 0 ] || { F=$((F+1)); echo "FAIL atomic.py crashed (exit $arc)"; }
+F=$((F + $(grep -c '^FAIL' $S/atomic.out))); P=$((P + $(grep -c '^ok' $S/atomic.out)))
 
 echo; echo "PASSED $P  FAILED $F"; [ $F = 0 ]
