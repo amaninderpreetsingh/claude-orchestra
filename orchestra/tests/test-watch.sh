@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Scenario tests for orch-watch (isolated ORCH_HOME, stub cmux + ps on PATH, fixture screens).
-set -u
+set -u; unset ORCH_CMUX  # its own stub only, even when run outside tests/run.sh
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-watch.XXXXXX"); trap 'rm -rf $S' EXIT; mkdir -p $S/bin $S/fx; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home TZ=UTC PATH=$S/bin:$PATH FX=$S/fx; W=$ROOT/bin/orch-watch
 PASS=0; FAIL=0
@@ -181,5 +181,13 @@ mkrun r5 surface:90 S1:surface:11; tree surface:11:ttys1 surface:90:ttys9; claud
 ( sleep 2; tree surface:90:ttys9 ) & start=$(date +%s)
 watch --run r5 --interval 1 --timeout 20; el=$(( $(date +%s) - start )); wait
 ok "event mid-wait → exits 0 promptly with the event" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD S1 surface-gone surface:11" ] && [ $el -le 6 ]'
+
+echo "-- ORCH_CMUX: the cmux binary orch uses, when cmux isn't on PATH"
+mkdir -p $S/alt $S/nocmux; mv $S/bin/cmux $S/alt/mycmux
+printf '#!/bin/sh\nexit 1\n' > $S/nocmux/cmux; chmod +x $S/nocmux/cmux               # the cmux on PATH: not running
+mkrun r6 surface:90 S1:surface:11; tree surface:90:ttys9; claude ttys9
+out=$(PATH=$S/nocmux:$PATH ORCH_CMUX=$S/alt/mycmux $W --run r6 --once 2>&1); rc=$?
+ok "ORCH_CMUX set → its tree is read: EVENT DEAD S1" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD S1 surface-gone surface:11" ]'
+mv $S/alt/mycmux $S/bin/cmux
 
 echo; echo "PASSED $PASS  FAILED $FAIL"; [ $FAIL = 0 ]

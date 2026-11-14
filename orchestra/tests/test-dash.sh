@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-dash.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block: reap kills unowned listeners in its range
+export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
 mkdir -p $S/stub; for x in caffeinate xcrun osascript; do printf '#!/bin/sh\nexit 0\n' > $S/stub/$x; chmod +x $S/stub/$x; done; export PATH=$S/stub:$PATH  # never the real caffeinate/simulators
 P=0; F=0
 ok(){ if eval "$2"; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1"; fi; }
@@ -55,11 +55,11 @@ echo '[{"id":"C2","text":"two"}]' > $S/c2.json; $O criteria-add --run $RUN --fil
 ok "criteria-add keeps C1 pass" 'python3 -c "import json;c=json.load(open(\"$D/criteria.json\"));assert [x[\"status\"] for x in c]==[\"pass\",\"pending\"]"'
 ok "criteria-add refuses duplicate id" '! $O criteria-add --run $RUN --file $S/c2.json >/dev/null 2>&1'
 
-# reap's orphan sweep covers this suite's private ORCH_PORT_BASE range (and nothing else)
+# reap leaves a listener orchestra never handed a port to (the orphan rule itself: test-orch-reap.sh)
 python3 -m http.server $ORCH_PORT_BASE --bind 127.0.0.1 >/dev/null 2>&1 & ORPH=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do nc -z 127.0.0.1 $ORCH_PORT_BASE 2>/dev/null && break; sleep 0.3; done
 $O reap --run $RUN >/dev/null 2>&1
-ok "reap sweeps an unowned listener in its own ORCH_PORT_BASE range" '! nc -z 127.0.0.1 $ORCH_PORT_BASE 2>/dev/null'
+ok "reap leaves an unallocated listener in its own ORCH_PORT_BASE range" 'kill -0 $ORPH 2>/dev/null'
 kill $ORPH 2>/dev/null; wait $ORPH 2>/dev/null
 
 # coordinator job ports survive reap; released by end-run

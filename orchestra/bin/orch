@@ -21,10 +21,10 @@ from pathlib import Path
 HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
 RUNS, LOCKS, EVENTS = HOME / "runs", HOME / "locks", HOME / "events"
 CAFF_PID = HOME / "state" / "caffeinate.pid"  # one `caffeinate -is` shared by every active run
+PORT_HISTORY = HOME / "state" / "port-history"  # <base>.json: the last owner a block was handed to (outlives release)
 MERGE_LOCK_MAX_SECS = 20 * 60          # lock covers only rebase+push, so this is generous
 PORT_BLOCK = 10                        # each worker gets its own 10-port block
-# tests set ORCH_PORT_BASE/SPAN to a private range: reap kills unowned listeners in the range, and an isolated
-# ORCH_HOME owns nothing outside itself (it killed live workers' and concurrent suites' servers)
+# tests set ORCH_PORT_BASE/SPAN to a private range so concurrent suites and live workers never share a block
 PORT_BASE = int(os.environ.get("ORCH_PORT_BASE", 20000))
 PORT_MAX = PORT_BASE + int(os.environ.get("ORCH_PORT_SPAN", 9990))
 PASS_ROLES = ("reviewer", "verifier")  # + "adversarial" when the worker is registered --risky
@@ -208,6 +208,12 @@ def port_in_use(p):
         return sk.connect_ex(("127.0.0.1", p)) == 0
 
 
+def remember_block(base, owner):
+    """Record that orchestra handed port block `base` to `owner` (reap's proof the block was ever orchestra's)."""
+    if isinstance(owner, str) and owner and (read_json(PORT_HISTORY / f"{base}.json") or {}).get("owner") != owner:
+        write_json(PORT_HISTORY / f"{base}.json", {"owner": owner, "at": now()})
+
+
 def alloc_ports(owner, dry=False):
     """The owner's port block (allocated on first call). dry: only report which block it would get."""
     pd = LOCKS / "ports"
@@ -215,6 +221,8 @@ def alloc_ports(owner, dry=False):
         pd.mkdir(parents=True, exist_ok=True)
     for x in pd.glob("*"):
         if x.name.isdigit() and (read_json(x / "owner.json") or {}).get("owner") == owner:
+            if not dry:
+                remember_block(int(x.name), owner)
             return int(x.name)
     for base in range(PORT_BASE, PORT_MAX, PORT_BLOCK):
         if any(port_in_use(p) for p in range(base, base + PORT_BLOCK)):
@@ -224,6 +232,7 @@ def alloc_ports(owner, dry=False):
                 continue
             return base
         if take_lock(pd / str(base), {"owner": owner, "at": now()}):
+            remember_block(base, owner)
             return base
     sys.exit("orch: no free port block")
 
@@ -232,6 +241,8 @@ def release_ports(owner):
     n = 0
     for x in (LOCKS / "ports").glob("*"):
         o = read_json(x / "owner.json")
+        if (o or {}).get("owner") == owner and x.name.isdigit():
+            remember_block(int(x.name), owner)
         if (o or {}).get("owner") == owner and steal_lock(x, o):
             n += 1
     return n
@@ -657,19 +668,52 @@ def _protected(ps):
     return keep
 
 
-def sweep(pids=(), ports=None, paths=(), dry=False):
-    """Kill pids + listeners on ports + anything running in/for paths, with their descendants.
+def path_re(p, prefix=False, others=()):
+    """A regex finding path p in text as a whole path component (p/... or p alone, so .../<run>-S1 never matches
+    .../<run>-S10). prefix=True: p may be followed by any non-alphanumeric separator (/tmp/<owner>-dd), except where
+    the text continues into one of `others`, the longer names of other owners (/tmp/<run>-api-docs-dd isn't api's)."""
+    end = r"(?![A-Za-z0-9])" if prefix else r"(?![A-Za-z0-9_.-])"  # a name character after p means another name
+    longer = [o[len(p):] for o in others if o.startswith(p) and len(o) > len(p) and not o[len(p)].isalnum()]
+    skip = "".join(f"(?!{re.escape(t)}(?![A-Za-z0-9]))" for t in longer)
+    return re.compile(re.escape(p) + skip + end)
+
+
+def resolved(p):
+    """p with its parent directory resolved (/tmp/x → /private/tmp/x on macOS): lsof reports resolved cwds."""
+    return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+
+
+def owner_names():
+    """Every owner name orchestra knows: workers and integration of every run, and port-block owners (held or
+    recorded) such as coordinator jobs (`orch ports --name`). For path_re's `others`."""
+    names = set()
+    for d in RUNS.glob("*"):
+        names.add(f"{d.name}-integrate")
+        names |= {wk["name"] for _, wk in workers_of(d, status=None) if isinstance(wk.get("name"), str)}
+    for f in [*PORT_HISTORY.glob("*.json"), *((LOCKS / "ports").glob("*/owner.json"))]:
+        o = (read_json(f) or {}).get("owner")
+        if isinstance(o, str) and o:
+            names.add(o)
+    return names
+
+
+def sweep(pids=(), ports=None, paths=(), prefixes=(), others=(), dry=False):
+    """Kill pids + listeners on ports + anything running in/for paths (whole directories) or prefixes (/tmp/<owner>
+    and /tmp/<owner>-*, never another owner's longer name in `others`), with their descendants.
     Returns (killed pids, freed RSS in MB)."""
     ps = _ps()
     targets = set(pids)
     if ports:
         targets |= set(_listeners(*ports))
-    if paths:
+    if paths or prefixes:
+        pats = [path_re(v) for p in paths for v in {p, resolved(p)}]
+        pats += [path_re(p, prefix=True, others=others) for p in prefixes]
+        pats += [path_re(resolved(p), prefix=True, others={resolved(o) for o in others}) for p in prefixes]
         for pid, cwd in _cwds().items():
-            if any(cwd == p or cwd.startswith(p + "/") for p in paths):
+            if any(x.match(cwd) for x in pats):
                 targets.add(pid)
         for pid, (_, _, cmd) in ps.items():
-            if any(p in cmd for p in paths):
+            if any(x.search(cmd) for x in pats):
                 targets.add(pid)
     kids = {}
     for pid, (ppid, _, _) in ps.items():
@@ -701,9 +745,10 @@ def sweep(pids=(), ports=None, paths=(), dry=False):
     return targets, mb
 
 
-def cleanup_worker(r, wk, full=True, dry=False):
+def cleanup_worker(r, wk, full=True, dry=False, names=None):
     """full: close pane, kill its processes, remove worktree/branch/derived data, release locks+ports.
-    not full (dead worker): kill leftover processes only, keep the worktree so it can resume."""
+    not full (dead worker): kill leftover processes only, keep the worktree so it can resume.
+    names: owner_names(), when the caller cleans several workers."""
     name, root = wk["name"], r["repo"]
     wt = f"{root}/.claude/worktrees/{name}"
     live = cmux_live_workspaces()
@@ -713,7 +758,9 @@ def cleanup_worker(r, wk, full=True, dry=False):
         holder = (read_json(LOCKS / "ports" / str(ports[0]) / "owner.json") or {}).get("owner")
         if holder and holder != name:
             ports = None
-    _, before_mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=True)  # measure before the pane closes
+    others = {f"/tmp/{o}" for o in (owner_names() if names is None else names) if o != name}
+    tmp = dict(paths=(wt,), prefixes=(f"/tmp/{name}",), others=others)
+    _, before_mb = sweep(ports=ports, **tmp, dry=True)  # measure before the pane closes
     if full and wk.get("workspace") and have_cmux() and (live is None or wk["workspace"] in live):
         did.append("pane")
         if not dry:
@@ -725,7 +772,7 @@ def cleanup_worker(r, wk, full=True, dry=False):
                     args += ["--workspace", r["coordinator_workspace"]]
             cmux(*args, timeout=30)
             time.sleep(2)  # the live session locks the worktree until it exits
-    killed, mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=dry)
+    killed, mb = sweep(ports=ports, **tmp, dry=dry)
     mb = max(mb, before_mb)
     if killed or mb >= 1:
         did.append(f"~{mb:.0f}MB of processes")
@@ -736,8 +783,10 @@ def cleanup_worker(r, wk, full=True, dry=False):
                 git(root, "worktree", "remove", "--force", "--force", wt, check=False)
         if not dry:
             git(root, "branch", "-D", f"worktree-{name}", check=False)
-            for x in Path("/tmp").glob(f"{name}*"):
-                shutil.rmtree(x, ignore_errors=True)
+            own = path_re(f"/tmp/{name}", prefix=True, others=others)
+            for x in Path("/tmp").glob(f"{name}*"):  # /tmp/<name> and /tmp/<name>-*, never /tmp/<run>-S10* for S1
+                if own.match(str(x)):
+                    shutil.rmtree(x, ignore_errors=True)
             unlock(root, name)
             release_ports(name)
             for res in (LOCKS / "resources").glob("*"):
@@ -863,10 +912,71 @@ def idle_secs(d, r, busy=()):
     return time.time() - max(last)
 
 
+def orphan_listeners(dry=False):
+    """Listeners on orchestra ports that orchestra can tie to itself and nobody live owns: the port's block was handed
+    out by alloc_ports (held now, or released but in PORT_HISTORY) to an owner that is no longer live, and the process
+    or one of its ancestors runs in a worktree of that owner's run (<repo>/.claude/worktrees/<run>-*). Anything else
+    in the range (a database on 27017, a server orchestra never started, a port never handed out) is left alone."""
+    listeners = _listeners(*ORCH_PORT_RANGE)
+    if not listeners:
+        return []
+    live_owner, ids = owner_rule(), [d.name for d in RUNS.glob("*")]
+    block_owner, held = {}, set()  # base -> owner it was handed to: the current holder, else the last one recorded
+    for x in PORT_HISTORY.glob("*.json"):
+        if x.stem.isdigit():
+            block_owner[int(x.stem)] = (read_json(x) or {}).get("owner")
+    for x in (LOCKS / "ports").glob("*"):
+        if x.name.isdigit() and x.is_dir():
+            o = (read_json(x / "owner.json") or {}).get("owner")
+            if not o and dir_age(x) > LOCK_GRACE_SECS:  # no owner.json past the grace period: a dead taker's, not held
+                continue
+            block_owner[int(x.name)] = o
+            held.add(int(x.name))
+    wt_roots = {}  # run id -> its repo's worktree dirs (as given and resolved: lsof reports resolved paths)
+    for rid in ids:
+        repo = (read_json(RUNS / rid / "run.json") or {}).get("repo")
+        if isinstance(repo, str) and repo:
+            wt_roots[rid] = {f"{x}/.claude/worktrees/" for x in (repo, os.path.realpath(repo))}
+    for b in () if dry else held:  # blocks held since before PORT_HISTORY existed get their record now, while the owner is known
+        remember_block(b, block_owner[b])
+    if not any((p - PORT_BASE) // PORT_BLOCK * PORT_BLOCK + PORT_BASE in block_owner for ps_ in listeners.values()
+               for p in ps_):
+        return []
+    ps, cwds = _ps(), _cwds()
+    keep = _protected(ps)
+
+    def in_run_worktree(pid, rid):
+        """pid or an ancestor runs in a worktree of run rid whose own owner is finished (a live worker's or the
+        active integration's server on a released block is theirs, not an orphan)."""
+        seen = set()
+        while pid and pid > 1 and pid not in seen and pid not in keep:
+            seen.add(pid)
+            c = cwds.get(pid) or ""
+            for root in wt_roots.get(rid, ()):
+                wt = c[len(root):].split("/")[0] if c.startswith(root) else ""
+                if wt and run_of(wt, ids) == rid and not live_owner(wt):
+                    return True
+            pid = ps.get(pid, (0,))[0]
+        return False
+
+    out = []
+    for pid, ports in listeners.items():
+        bases = {(p - PORT_BASE) // PORT_BLOCK * PORT_BLOCK + PORT_BASE for p in ports}
+        # a held block whose holder is live (or not yet written: a lock being taken) keeps its listener;
+        # a released block has no live holder, whoever it was last handed to
+        if any(b in held and (live_owner(block_owner[b]) or not block_owner[b]) for b in bases):
+            continue
+        owners = [block_owner.get(b) for b in bases]
+        rids = {run_of(o, ids) for o in owners if isinstance(o, str)} - {None}
+        if any(in_run_worktree(pid, rid) for rid in rids):
+            out.append(pid)
+    return out
+
+
 def cmd_reap(a):
     """Clean up anything finished/dead that is still using memory. Safe to run any time (the 30-min heartbeat does)."""
     runs = [RUNS / a.run] if a.run else [RUNS / r["id"] for r in active_runs() if r.get("id")]
-    live, total, lines = cmux_live_workspaces(), 0.0, []
+    live, total, lines, names = cmux_live_workspaces(), 0.0, [], owner_names()
     for d in runs:
         r = read_json(d / "run.json") or {}
         for w, wk in workers_of(d, status=None):
@@ -875,14 +985,14 @@ def cmd_reap(a):
                     if not a.dry_run:
                         wk.update(status="dead", died=now())
                         write_json(w, wk)
-                    did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run)
+                    did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run, names=names)
                     lines.append(f"{wk['name']}: pane gone → marked dead; {', '.join(did) or 'no leftovers'} (worktree kept for --resume)")
                     total += mb
                 continue
             if wk.get("status") == "dead":
-                did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run)
+                did, mb = cleanup_worker(r, wk, full=False, dry=a.dry_run, names=names)
             else:
-                did, mb = cleanup_worker(r, wk, full=True, dry=a.dry_run)
+                did, mb = cleanup_worker(r, wk, full=True, dry=a.dry_run, names=names)
                 if did and not a.dry_run:
                     wk["cleaned"] = now()
                     write_json(w, wk)
@@ -891,12 +1001,7 @@ def cmd_reap(a):
                 total += mb
         if r.get("repo") and Path(r["repo"]).exists() and not a.dry_run:
             git(r["repo"], "worktree", "prune", check=False)
-    # orphan listeners on orchestra ports whose block belongs to no live owner
-    live_owner = owner_rule()
-    owned = {int(x.name) for x in (LOCKS / "ports").glob("*") if x.name.isdigit()
-             and live_owner((read_json(x / "owner.json") or {}).get("owner"))}
-    orphans = [pid for pid, ports in _listeners(*ORCH_PORT_RANGE).items()
-               if all((p - PORT_BASE) // PORT_BLOCK * PORT_BLOCK + PORT_BASE not in owned for p in ports)]
+    orphans = orphan_listeners(dry=a.dry_run)
     if orphans:
         killed, mb = sweep(pids=orphans, dry=a.dry_run)
         lines.append(f"orphan servers on orchestra ports: {len(killed)} process(es) {mb:.0f}MB")
@@ -944,9 +1049,9 @@ def cmd_end_run(a):
         if bad:
             sys.exit(f"orch: refusing to end run — not passing on shipped code: {', '.join(bad)} (orch criteria-check)")
     # tear everything down: every worker (whatever its state), the integration worktree, its processes
-    total = 0.0
+    total, names = 0.0, owner_names()
     for w, wk in workers_of(RUNS / a.run, status=None):
-        did, mb = cleanup_worker(r, wk, full=True)
+        did, mb = cleanup_worker(r, wk, full=True, names=names)
         total += mb
         if wk.get("status") == "active":
             wk["status"] = a.status
@@ -955,7 +1060,7 @@ def cmd_end_run(a):
         if did:
             print(f"cleaned {wk['name']}: {', '.join(did)}")
     integ = {"name": f"{a.run}-integrate", "ports": None}
-    did, mb = cleanup_worker(r, integ, full=True)
+    did, mb = cleanup_worker(r, integ, full=True, names=names)
     total += mb
     if did:
         print(f"cleaned {integ['name']}: {', '.join(did)}")
@@ -976,6 +1081,8 @@ def cmd_end_run(a):
     ids = [x.name for x in RUNS.glob("*")]
     for x, o in lock_owners():  # everything still held under this run's names: ports, resources, merge, files
         if run_of((o or {}).get("owner"), ids) == a.run:
+            if x.parent == LOCKS / "ports" and x.name.isdigit():
+                remember_block(int(x.name), o.get("owner"))
             steal_lock(x, o)
     r.update(status=a.status, ended=now())
     write_json(p, r)

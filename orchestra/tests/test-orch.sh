@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block: reap kills unowned listeners in its range
+export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
 # fakes on PATH: caffeinate logs its pid and idles; cmux (spawn tests only) logs args, answers from $S/groups.json
 mkdir -p $S/stub $S/cmuxstub; export CAFF_LOG=$S/caff.log CMUX_LOG=$S/cmux.log
 printf '#!/bin/sh\necho $$ >> "$CAFF_LOG"\nsleep 120 & trap "kill $! 2>/dev/null; exit" TERM\nwait\n' > $S/stub/caffeinate

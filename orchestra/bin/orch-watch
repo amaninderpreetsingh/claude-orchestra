@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
 RUNS, STATE = HOME / "runs", HOME / "state"
+CMUX = os.environ.get("ORCH_CMUX") or "cmux"  # same as orch: tests and users without cmux on PATH point this at it
 RESUME_GRACE = 30 * 60   # after resuming, a banner still on screen is the old one for this long
 BOTTOM = 12              # the banner sits just above the prompt box; only the screen's last non-blank lines count
 # Claude's limit line, opening the line (after the ⎿ gutter) and carrying a reset time; ordinary text that merely
@@ -47,7 +48,7 @@ def write_json(p, data):
 
 def cmux(*args):
     try:
-        r = subprocess.run(["cmux", *args], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([CMUX, *args], capture_output=True, text=True, timeout=10)
         return r.stdout if r.returncode == 0 else None
     except Exception:
         return None

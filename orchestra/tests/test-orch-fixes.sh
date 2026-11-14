@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch-fixes.XXXXXX"); trap 'for c in $(cat $S/caff.log 2>/dev/null); do kill $c 2>/dev/null; done; rm -rf $S' EXIT; cd $S  # unique: suites run concurrently
 O=$ROOT/bin/orch
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port block: reap kills unowned listeners in its range
+export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
 mkdir -p $S/stub; export CAFF_LOG=$S/caff.log FAKE_LOG=$S/fake.log PATHCMUX_LOG=$S/pathcmux.log CLAUDE_LOG=$S/claude.log
 # caffeinate stub: matches orch's `caffeinate -is` check, idles until TERM
 printf '#!/bin/sh\necho $$ >> "$CAFF_LOG"\nsleep 120 & trap "kill $! 2>/dev/null; exit" TERM\nwait\n' > $S/stub/caffeinate
