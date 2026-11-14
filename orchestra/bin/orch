@@ -6,13 +6,16 @@ once on the same or different repos. Anything exclusive (file ownership, pushing
 branch) is an atomic mkdir lock keyed by repo. Evidence (gate runs, reviewer/verifier
 verdicts, gates-ok) lives in the worktree's own git dir, so push-guard can check it.
 
-Coordinator:  new-run, run-branch, baseline, add-worker, lock/unlock/locks, criteria-init,
-              criteria-check, doctor, finish-worker, end-run, status, broadcast
-Worker:       register, gates, verdict, criterion, gates-ok, merge-lock/merge-unlock, merged
+Run:          new-run, run-branch, baseline, criteria-init, criteria-add, criteria-check, end-run
+Workers:      spawn (--dry-run), close, add-worker, finish-worker, broadcast, ports
+Files/locks:  lock, unlock, locks, resource-lock, resource-unlock
+Health:       doctor (--fix), reap, status, report, dash, note, gc (deletes ended runs' bulk)
+Worker:       register, gates, verdict, criterion, gates-ok, merge-lock, merge-unlock, merged
 Tier S:       tier (main checkout: gates + lite reviewer PASS, then push)
+Env: ORCH_HOME (state dir), ORCH_CMUX (cmux binary, default `cmux`), ORCH_PORT_BASE/ORCH_PORT_SPAN.
 Run `orch <cmd> -h` for flags.
 """
-import argparse, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time
+import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
@@ -25,11 +28,21 @@ PORT_BLOCK = 10                        # each worker gets its own 10-port block
 PORT_BASE = int(os.environ.get("ORCH_PORT_BASE", 20000))
 PORT_MAX = PORT_BASE + int(os.environ.get("ORCH_PORT_SPAN", 9990))
 PASS_ROLES = ("reviewer", "verifier")  # + "adversarial" when the worker is registered --risky
+CMUX = os.environ.get("ORCH_CMUX") or "cmux"  # tests point this at a stub; every cmux call goes through it
+LOCK_GRACE_SECS = 60                   # a lock dir with no owner.json is held this long (legacy/crashed taker)
+IDLE_RUN_SECS = 12 * 3600              # reap flags an active run with no active worker for this long
 
 
 # ---------------------------------------------------------------- helpers
 def run(args, cwd=None, check=True, timeout=None):
-    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        if cwd and not Path(cwd).is_dir():
+            if not check:
+                return ""
+            sys.exit(f"orch: {args[0]}: no such directory {cwd}")
+        sys.exit(f"orch: {args[0]} not found")
     if check and r.returncode != 0:
         sys.exit(f"orch: {' '.join(map(str, args))} failed: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout.strip()
@@ -95,10 +108,35 @@ def patch_id(path, target):
     return out.split()[0] if out else None
 
 
+def have_cmux():
+    return bool(shutil.which(CMUX))
+
+
+def no_cmux():
+    sys.stderr.write(f"orch: cmux not found ({CMUX}) — install cmux (macOS, see README → Requirements) "
+                     f"or set ORCH_CMUX to its binary, then retry\n")
+    sys.exit(2)
+
+
+def need_cmux():
+    """Commands that only make sense with cmux stop here with one line instead of a traceback."""
+    if not have_cmux():
+        no_cmux()
+
+
+def cmux(*args, timeout=10):
+    """Run cmux; a missing/unrunnable binary or a hang reads as a failed call (returncode 127/124), never a traceback."""
+    try:
+        return subprocess.run([CMUX, *args], capture_output=True, text=True, timeout=timeout)
+    except OSError as e:  # not found, not executable, no #! line
+        return subprocess.CompletedProcess([CMUX, *args], 127, "", f"cmux not runnable: {e}")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess([CMUX, *args], 124, "", "cmux timed out")
+
+
 def cmux_identify():
     try:
-        out = subprocess.run(["cmux", "identify", "--json"], capture_output=True, text=True, timeout=10)
-        return json.loads(out.stdout)["caller"]
+        return json.loads(cmux("identify", "--json").stdout)["caller"]
     except Exception:
         return {}
 
@@ -111,7 +149,10 @@ def cmux_workspace():
 def cmux_live_workspaces():
     """Every live workspace and surface ref across all windows."""
     try:
-        out = subprocess.run(["cmux", "tree", "--all", "--json"], capture_output=True, text=True, timeout=10).stdout
+        r = cmux("tree", "--all", "--json")
+        if r.returncode != 0:  # no cmux, not running, hung: unknown — never "everyone is dead"
+            return None
+        out = r.stdout
         return set(re.findall(r'"ref"\s*:\s*"((?:workspace|surface):\d+)"', out))
     except Exception:
         return None  # unknown → never treat anyone as dead
@@ -120,19 +161,17 @@ def cmux_live_workspaces():
 def cmux_group_for(workspace, key, name):
     """The workspace group holding `workspace`; creates one anchored on it (idempotent per run) if none."""
     try:
-        out = subprocess.run(["cmux", "workspace-group", "list", "--json"], capture_output=True, text=True, timeout=10).stdout
+        out = cmux("workspace-group", "list", "--json").stdout
         for g in json.loads(out).get("groups", []):
             if workspace in g.get("member_workspace_refs", []):
                 if g.get("anchor_workspace_ref") == workspace:
                     return g["ref"]
                 # coordinator sits in another group (stale run, or as a plain member): take it out so it heads a new one
-                subprocess.run(["cmux", "workspace-group", "remove", "--workspace", workspace],
-                               capture_output=True, text=True, timeout=10)
+                cmux("workspace-group", "remove", "--workspace", workspace)
                 break
     except Exception:
         pass
-    out = subprocess.run(["cmux", "workspace-group", "create", "--name", name, "--from", workspace,
-                          "--idempotency-key", key], capture_output=True, text=True, timeout=10).stdout
+    out = cmux("workspace-group", "create", "--name", name, "--from", workspace, "--idempotency-key", key).stdout
     m = re.search(r"workspace_group:\d+", out)
     return m.group(0) if m else None
 
@@ -157,7 +196,7 @@ def cmux_first_surface(workspace):
                     return hit
         return None
     try:
-        out = subprocess.run(["cmux", "tree", "--all", "--json"], capture_output=True, text=True, timeout=10).stdout
+        out = cmux("tree", "--all", "--json").stdout
         return walk(json.loads(out), False)
     except Exception:
         return None
@@ -169,29 +208,31 @@ def port_in_use(p):
         return sk.connect_ex(("127.0.0.1", p)) == 0
 
 
-def alloc_ports(owner):
+def alloc_ports(owner, dry=False):
+    """The owner's port block (allocated on first call). dry: only report which block it would get."""
     pd = LOCKS / "ports"
-    pd.mkdir(parents=True, exist_ok=True)
+    if not dry:
+        pd.mkdir(parents=True, exist_ok=True)
     for x in pd.glob("*"):
-        if (read_json(x / "owner.json") or {}).get("owner") == owner:
+        if x.name.isdigit() and (read_json(x / "owner.json") or {}).get("owner") == owner:
             return int(x.name)
     for base in range(PORT_BASE, PORT_MAX, PORT_BLOCK):
         if any(port_in_use(p) for p in range(base, base + PORT_BLOCK)):
             continue
-        try:
-            (pd / str(base)).mkdir()
-        except FileExistsError:
-            continue
-        write_json(pd / str(base) / "owner.json", {"owner": owner, "at": now()})
-        return base
+        if dry:
+            if (pd / str(base)).exists():
+                continue
+            return base
+        if take_lock(pd / str(base), {"owner": owner, "at": now()}):
+            return base
     sys.exit("orch: no free port block")
 
 
 def release_ports(owner):
     n = 0
     for x in (LOCKS / "ports").glob("*"):
-        if (read_json(x / "owner.json") or {}).get("owner") == owner:
-            shutil.rmtree(x, ignore_errors=True)
+        o = read_json(x / "owner.json")
+        if (o or {}).get("owner") == owner and steal_lock(x, o):
             n += 1
     return n
 
@@ -199,12 +240,7 @@ def release_ports(owner):
 def cmux_message(target, text, sender):
     if not target:
         return False
-    try:
-        r = subprocess.run(["cmux", "agent", "message", target, "--from", sender, "--", text],
-                           capture_output=True, text=True, timeout=20)
-        return r.returncode == 0
-    except Exception:
-        return False
+    return cmux("agent", "message", target, "--from", sender, "--", text, timeout=20).returncode == 0
 
 
 def runs_for(slug, status="active"):
@@ -265,10 +301,7 @@ def file_lock_dir(slug, rel):
 def cmd_new_run(a):
     root = repo_root(a.repo)
     slug = re.sub(r"[^a-z0-9]+", "-", a.title.lower()).strip("-")[:24] or "run"
-    run_id = f"{time.strftime('%m%d-%H%M')}-{slug}"
-    d = RUNS / run_id
-    if d.exists():
-        sys.exit(f"orch: run {run_id} exists")
+    base_id = f"{time.strftime('%m%d-%H%M')}-{slug}"
     git(root, "fetch", "--quiet", "origin")
     b = default_branch(root)
     excl = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info" / "exclude"
@@ -276,12 +309,23 @@ def cmd_new_run(a):
     if ".claude/worktrees/" not in (excl.read_text() if excl.exists() else ""):
         with open(excl, "a") as f:  # keep worker worktrees out of `git add .` without touching tracked files
             f.write("\n.claude/worktrees/\n")
-    write_json(d / "run.json", {
-        "id": run_id, "title": a.title, "repo": root, "repo_slug": slug_of(root),
-        "default_branch": b, "target": b, "base_sha": git(root, "rev-parse", f"origin/{b}"),
-        "coordinator": a.coordinator or cmux_workspace(),
-        "coordinator_workspace": a.coordinator_workspace or cmux_identify().get("workspace_ref"),
-        "status": "active", "created": now()})
+    info = {"title": a.title, "repo": root, "repo_slug": slug_of(root),
+            "default_branch": b, "target": b, "base_sha": git(root, "rev-parse", f"origin/{b}"),
+            "coordinator": a.coordinator or cmux_workspace(),
+            "coordinator_workspace": a.coordinator_workspace or cmux_identify().get("workspace_ref"),
+            "status": "active", "created": now()}
+    RUNS.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 1000):  # same title twice in one minute → -2, -3 (mkdir claims the id atomically)
+        run_id = base_id if n == 1 else f"{base_id}-{n}"
+        d = RUNS / run_id
+        try:
+            d.mkdir()
+            break
+        except FileExistsError:
+            continue
+    else:
+        sys.exit(f"orch: no free run id for {base_id}")
+    write_json(d / "run.json", {"id": run_id, **info})
     for sub in ("slices", "artifacts", "workers"):
         (d / sub).mkdir(parents=True, exist_ok=True)
     caffeinate_hold()
@@ -345,17 +389,15 @@ def cmd_lock(a):
     slug, taken = slug_of(a.repo), []
     for rel in a.files:
         d = file_lock_dir(slug, rel)
-        d.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            d.mkdir()
-            write_json(d / "owner.json", {"owner": a.owner, "file": rel, "at": now()})
-            taken.append(d)
-        except FileExistsError:
+        info = {"owner": a.owner, "file": rel, "at": now()}
+        if take_lock(d, info):
+            taken.append((d, info))
+        else:
             holder = (read_json(d / "owner.json") or {}).get("owner", "?")
             if holder == a.owner:
                 continue
-            for t in taken:  # all-or-nothing
-                shutil.rmtree(t, ignore_errors=True)
+            for t, info in taken:  # all-or-nothing, and only the locks this call took
+                steal_lock(t, info)
             sys.exit(f"LOCKED {rel} by {holder}")
     print(f"locked {len(a.files)} file(s) for {a.owner}")
 
@@ -363,9 +405,8 @@ def cmd_lock(a):
 def unlock(repo, owner, files=()):
     base, n = LOCKS / slug_of(repo) / "files", 0
     for d in base.glob("*"):
-        o = read_json(d / "owner.json") or {}
-        if o.get("owner") == owner and (not files or o.get("file") in files):
-            shutil.rmtree(d, ignore_errors=True)
+        o = read_json(d / "owner.json")
+        if (o or {}).get("owner") == owner and (not files or o.get("file") in files) and steal_lock(d, o):
             n += 1
     return n
 
@@ -418,6 +459,8 @@ def cmd_ports(a):
     if not (RUNS / a.run / "run.json").exists():
         sys.exit(f"orch: no run {a.run}")
     owner = f"{a.run}-{a.name}"
+    if not a.release:
+        caffeinate_hold()  # integration work on a run reap found idle
     if a.release:
         print(f"released {release_ports(owner)} block(s) for {owner}")
         return
@@ -454,35 +497,35 @@ def cmd_doctor(a):
                 write_json(w, wk)
                 print(f"      → marked dead. Respawn (resumes from its progress file): "
                       f"orch spawn --run {r['id']} --slice {wk['slice']} --resume")
-    active_owners = {wk["name"] for s in slugs for d, _ in runs_for(s) for _, wk in workers_of(d)}
-    all_active = {wk["name"] for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"
-                  for _, wk in workers_of(d)}
-    for x in (LOCKS / "resources").glob("*"):
-        o = (read_json(x / "owner.json") or {}).get("owner", "")
-        base = re.sub(r"-(verify|integrate)$", "", o)
-        if base not in all_active and not o.endswith("-integrate"):
-            print(f"   orphan {x.name} lock by {o}" + (" → released" if a.fix else ""))
-            if a.fix:
-                shutil.rmtree(x, ignore_errors=True)
-    for x in (LOCKS / "ports").glob("*"):
-        o = (read_json(x / "owner.json") or {}).get("owner")
-        if o not in all_active:
-            print(f"   orphan port block {x.name} by {o}" + (" → released" if a.fix else ""))
-            if a.fix:
-                shutil.rmtree(x, ignore_errors=True)
-    for s in slugs:
+    live_owner = owner_rule()
+
+    def orphan(d):  # owner.json missing: only an orphan once past the grace period (a taker may be mid-write)
+        o = read_json(d / "owner.json")
+        if not isinstance(o, dict):
+            return dir_age(d) > LOCK_GRACE_SECS, o
+        return not live_owner(o.get("owner")), o
+
+    def report(d, o, what):
+        gone = a.fix and steal_lock(d, o)  # unchanged since judged, else someone retook it: leave it
+        print(f"   orphan {what}" + (" → released" if gone else " → changed meanwhile, kept" if a.fix else ""))
+    for x in sorted((LOCKS / "resources").glob("*")):
+        bad, o = orphan(x)
+        if bad:
+            report(x, o, f"{x.name} lock by {(o or {}).get('owner')}")
+    for x in sorted((LOCKS / "ports").glob("*")):
+        bad, o = orphan(x)
+        if bad:
+            report(x, o, f"port block {x.name} by {(o or {}).get('owner')}")
+    for s in sorted(slugs):
         m = LOCKS / s / "merge"
-        o = read_json(m / "owner.json")
-        if o and o.get("owner") not in active_owners and not o.get("owner", "").endswith("-integrate"):
-            print(f"   orphan MERGE LOCK held by {o.get('owner')}" + (" → released" if a.fix else ""))
-            if a.fix:
-                shutil.rmtree(m, ignore_errors=True)
-        for d in (LOCKS / s / "files").glob("*"):
-            fo = read_json(d / "owner.json") or {}
-            if fo.get("owner") not in active_owners:
-                print(f"   orphan file lock {fo.get('file')} by {fo.get('owner')}" + (" → released" if a.fix else ""))
-                if a.fix:
-                    shutil.rmtree(d, ignore_errors=True)
+        if m.is_dir():
+            bad, o = orphan(m)
+            if bad:
+                report(m, o, f"MERGE LOCK held by {(o or {}).get('owner')}")
+        for d in sorted((LOCKS / s / "files").glob("*")):
+            bad, fo = orphan(d)
+            if bad:
+                report(d, fo, f"file lock {(fo or {}).get('file')} by {(fo or {}).get('owner')}")
 
 
 def cmd_finish_worker(a):
@@ -507,15 +550,19 @@ def cmd_spawn(a):
     name, root = f"{a.run}-{a.slice}", r["repo"]
     trusted = ((read_json(Path.home() / ".claude.json", {}) or {}).get("projects", {}).get(root, {}) or {}).get("hasTrustDialogAccepted")
     if not trusted and not os.environ.get("ORCH_SKIP_TRUST"):
+        if a.dry_run:
+            sys.exit(f"orch: dry run — {root} is not trusted yet, so spawn would refuse (and add it to NEEDS YOU)")
         add_need(d, f"Trust this folder: in a terminal run `cd {root} && claude`, accept the trust prompt, then /exit")
         sys.exit(f"orch: {root} is not trusted yet — `claude -w` would hang. Added to NEEDS YOU; spawn again once trusted.")
     wt = f"{root}/.claude/worktrees/{name}"
-    port = alloc_ports(name)
+    if not a.dry_run:
+        need_cmux()
+    if a.resume and not Path(wt).exists():
+        sys.exit(f"orch: --resume but no worktree at {wt}")
+    port = alloc_ports(name, dry=a.dry_run)
     env = f"ORCH_PORT={port} ORCH_PORT_END={port + PORT_BLOCK - 1}"
     worker = f"/worker {brief}"
-    # Workers load only the MCP servers they use (playwright, context7; cmux adds cmux-cua itself):
-    # the full set costs ~1.5GB per worker. The coordinator keeps everything (console tools, real Chrome).
-    # Workers load only the MCP servers they use (worker-mcp.json: playwright, context7) — the full set costs
+    # The coordinator keeps every MCP server (console tools, real Chrome). Workers load only the MCP servers they use (worker-mcp.json: playwright, context7) — the full set costs
     # ~1GB more per worker. Native slices launch normally so cmux injects its Computer Use server (cmux only
     # does that, and only hands over its socket token, when no --strict-mcp-config is given).
     m = re.search(r"^[\s>*`-]*MODEL:[\s*`]*([A-Za-z][\w.\[\]-]*)", brief.read_text(), re.M)  # brief `MODEL: sonnet` overrides
@@ -524,23 +571,35 @@ def cmd_spawn(a):
     if (HOME / "worker-mcp.json").exists() and not (a.all_mcp or a.native):
         lean = f"--strict-mcp-config --mcp-config {shlex.quote(str(HOME / 'worker-mcp.json'))} "
     if a.resume:
-        if not Path(wt).exists():
-            sys.exit(f"orch: --resume but no worktree at {wt}")
         cmdline = f"cd {shlex.quote(wt)} && {env} claude {lean}{model}-n {name} --permission-mode auto {shlex.quote(worker)}"
     else:
         cmdline = f"cd {shlex.quote(root)} && {env} claude {lean}{model}-w {name} -n {name} --permission-mode auto {shlex.quote(worker)}"
     # Each worker gets its own workspace in the coordinator's sidebar group (created on first spawn).
     ws = r.get("coordinator_workspace")
+    if a.dry_run:
+        print(f"dry run — nothing started, no cmux/claude called, no ports allocated\n"
+              f"group: {'the sidebar group anchored on ' + ws + ' (created if none)' if ws else 'none (no coordinator workspace)'}\n"
+              f"ports: {port}-{port + PORT_BLOCK - 1} (first free block now)\n"
+              f"would run: {shlex.join([CMUX, 'new-workspace', '--name', name, '--cwd', root, '--command', cmdline, '--focus', 'false'] + (['--group', '<that group>', '--group-placement', 'end'] if ws else []))}\n"
+              f"worker command: {cmdline}")
+        return
+    caffeinate_hold()  # a run reap found idle (and released caffeinate for) is busy again
     group = cmux_group_for(ws, a.run, f"{Path(root).name} · {r.get('title', a.run)}") if ws else None
-    args = ["cmux", "new-workspace", "--name", name, "--cwd", root, "--command", cmdline, "--focus", "false"]
+    if group and r.get("group") != group:
+        r = read_json(d / "run.json") or r  # fresh copy: don't undo a write made since we read it
+        r["group"] = group  # end-run dissolves it
+        write_json(d / "run.json", r)
+    args = [CMUX, "new-workspace", "--name", name, "--cwd", root, "--command", cmdline, "--focus", "false"]
     if group:
         args += ["--group", group, "--group-placement", "end"]
-    out = run(args)
+    res = cmux(*args[1:], timeout=None)  # no timeout: a late reply would leave an untracked worker running
+    out = res.stdout.strip()
     wm = re.search(r"workspace:\d+", out)
     surface = cmux_first_surface(wm.group(0)) if wm else None
     if not surface:
         release_ports(name)
-        sys.exit(f"orch: could not read the new workspace's surface from: {out}")
+        sys.exit(f"orch: could not read the new workspace's surface from: {out or '(no output)'}"
+                 + (f" — cmux said: {res.stderr.strip()}" if res.stderr.strip() else ""))
     write_json(d / "workers" / f"{a.slice}.json", {
         "run": a.run, "slice": a.slice, "name": name, "workspace": surface, "ws_ref": wm.group(0), "target": r["target"],
         "ports": [port, port + PORT_BLOCK - 1], "lean_mcp": bool(lean), "status": "active", "started": now()})
@@ -655,16 +714,16 @@ def cleanup_worker(r, wk, full=True, dry=False):
         if holder and holder != name:
             ports = None
     _, before_mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=True)  # measure before the pane closes
-    if full and wk.get("workspace") and (live is None or wk["workspace"] in live):
+    if full and wk.get("workspace") and have_cmux() and (live is None or wk["workspace"] in live):
         did.append("pane")
         if not dry:
             if wk.get("ws_ref"):
-                args = ["cmux", "workspace", "close", "--workspace", wk["ws_ref"], "--force"]
+                args = ["workspace", "close", "--workspace", wk["ws_ref"], "--force"]
             else:  # older workers opened as panes in the coordinator's workspace
-                args = ["cmux", "close-surface", "--surface", wk["workspace"], "--force"]
+                args = ["close-surface", "--surface", wk["workspace"], "--force"]
                 if r.get("coordinator_workspace"):
                     args += ["--workspace", r["coordinator_workspace"]]
-            subprocess.run(args, capture_output=True, text=True)
+            cmux(*args, timeout=30)
             time.sleep(2)  # the live session locks the worktree until it exits
     killed, mb = sweep(ports=ports, paths=(wt, f"/tmp/{name}"), dry=dry)
     mb = max(mb, before_mb)
@@ -682,8 +741,10 @@ def cleanup_worker(r, wk, full=True, dry=False):
             unlock(root, name)
             release_ports(name)
             for res in (LOCKS / "resources").glob("*"):
-                if (read_json(res / "owner.json") or {}).get("owner", "").startswith(name):
-                    shutil.rmtree(res, ignore_errors=True)
+                ro = read_json(res / "owner.json")
+                o = (ro or {}).get("owner") or ""
+                if o in (name, f"{name}-verify"):  # its own, never S10's for S1 or api-docs's for api
+                    steal_lock(res, ro)
     return did, mb
 
 
@@ -712,14 +773,99 @@ def sims_down(dry=False):
     return f"orch-sim reap{' --dry-run' if dry else ''}: {out}" if out else ""
 
 
+def active_runs(except_run=None):
+    """run.json of every active run (but except_run)."""
+    out = []
+    for d in sorted(RUNS.glob("*")):
+        r = read_json(d / "run.json")
+        if isinstance(r, dict) and r.get("status") == "active" and d.name != except_run:
+            out.append(r)
+    return out
+
+
 def any_active_run(except_run=None):
-    return any((read_json(d / "run.json") or {}).get("status") == "active" and d.name != except_run
-               for d in RUNS.glob("*"))
+    return bool(active_runs(except_run))
+
+
+def run_of(owner, ids=None):
+    """The run an owner name belongs to: the LONGEST run id it extends with "-" (so `X-2-S1` is run X-2's, not X's)."""
+    ids = [d.name for d in RUNS.glob("*")] if ids is None else ids
+    hits = [rid for rid in ids if owner and owner.startswith(f"{rid}-")]
+    return max(hits, key=len) if hits else None
+
+
+TERMINAL = ("done", "merged", "aborted")  # finished workers; `dead`/`restarted` keep their locks for --resume/respawn
+
+
+def owner_rule(busy=False):
+    """Lock/port owner → is it live? doctor and reap share this one rule:
+    - `ops-*` (console chores outside runs): live;
+    - a worker of an active run (`<run>-<slice>`, or its `<run>-<slice>-verify` job): live unless the worker finished
+      (TERMINAL). busy=True (reap's idle check) counts only ACTIVE workers, so dead leftovers don't keep a run awake;
+    - any other name under an active run (`<run>-integrate*`, `orch ports` blocks, locks taken before spawn): live;
+    - anything else (ended runs, unknown names): not live."""
+    rids = {r["id"] for r in active_runs() if r.get("id")}
+    ids = [d.name for d in RUNS.glob("*")]
+    workers = {wk["name"]: wk.get("status") for rid in rids for _, wk in workers_of(RUNS / rid, status=None)
+               if wk.get("slice") != "integrate"}
+
+    def live(o):
+        if not o:
+            return False
+        if o.startswith("ops-"):
+            return True
+        if run_of(o, ids) not in rids:
+            return False
+        w = o[:-len("-verify")] if o.endswith("-verify") and o[:-len("-verify")] in workers else o
+        if w not in workers:
+            return True
+        return workers[w] == "active" if busy else workers[w] not in TERMINAL
+    return live
+
+
+def lock_owners():
+    """(lock dir, owner.json dict or None) for every orch lock and port block."""
+    dirs = [*(LOCKS / "ports").glob("*"), *(LOCKS / "resources").glob("*"), *LOCKS.glob("*/merge"), *LOCKS.glob("*/files/*")]
+    return [(x, read_json(x / "owner.json")) for x in dirs if not x.name.startswith(".")]
+
+
+def dir_age(d):
+    try:
+        return time.time() - d.stat().st_mtime
+    except FileNotFoundError:
+        return 0
+
+
+def ts(x):
+    """Epoch of an orch timestamp (now() format), or None."""
+    try:
+        return time.mktime(time.strptime(x, "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def idle_secs(d, r, busy=()):
+    """Seconds an active run has had no active worker and no file change; None if it has an active worker or is in
+    `busy` (runs that took a live lock or port block within IDLE_RUN_SECS, e.g. a coordinator's integration verifier).
+    Locks are reservations and outlive the work, so only a recent one counts as activity."""
+    if d.name in busy or any(True for _ in workers_of(d)):
+        return None
+    last = [ts(r.get("created")) or 0]
+    for _, wk in workers_of(d, status=None):
+        last += [ts(wk.get(k)) or 0 for k in ("started", "finished", "merged", "died", "cleaned")]
+    for sub in (d, d / "slices", d / "workers"):
+        for f in sub.glob("*"):
+            try:
+                if f.is_file():
+                    last.append(f.stat().st_mtime)
+            except FileNotFoundError:
+                pass  # a write_json temp file renamed away mid-scan
+    return time.time() - max(last)
 
 
 def cmd_reap(a):
     """Clean up anything finished/dead that is still using memory. Safe to run any time (the 30-min heartbeat does)."""
-    runs = [RUNS / a.run] if a.run else [d for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"]
+    runs = [RUNS / a.run] if a.run else [RUNS / r["id"] for r in active_runs() if r.get("id")]
     live, total, lines = cmux_live_workspaces(), 0.0, []
     for d in runs:
         r = read_json(d / "run.json") or {}
@@ -745,21 +891,36 @@ def cmd_reap(a):
                 total += mb
         if r.get("repo") and Path(r["repo"]).exists() and not a.dry_run:
             git(r["repo"], "worktree", "prune", check=False)
-    # orphan listeners on orchestra ports whose block belongs to no active worker
-    active = {wk["name"] for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"
-              for _, wk in workers_of(d)}
-    active_runs = [d.name for d in RUNS.glob("*") if (read_json(d / "run.json") or {}).get("status") == "active"]
-    owned = {int(x.name) for x in (LOCKS / "ports").glob("*")
-             if (lambda o: o in active or any(o.startswith(f"{rid}-") for rid in active_runs))(
-                 (read_json(x / "owner.json") or {}).get("owner", ""))}
+    # orphan listeners on orchestra ports whose block belongs to no live owner
+    live_owner = owner_rule()
+    owned = {int(x.name) for x in (LOCKS / "ports").glob("*") if x.name.isdigit()
+             and live_owner((read_json(x / "owner.json") or {}).get("owner"))}
     orphans = [pid for pid, ports in _listeners(*ORCH_PORT_RANGE).items()
                if all((p - PORT_BASE) // PORT_BLOCK * PORT_BLOCK + PORT_BASE not in owned for p in ports)]
     if orphans:
         killed, mb = sweep(pids=orphans, dry=a.dry_run)
         lines.append(f"orphan servers on orchestra ports: {len(killed)} process(es) {mb:.0f}MB")
         total += mb
+    # active runs nobody is working on: flag them; if every active run is idle, stop keeping the Mac awake
+    idle, ids = {}, [x.name for x in RUNS.glob("*")]
+    working = owner_rule(busy=True)
+    taken = lambda o: o["at"] if isinstance(o.get("at"), (int, float)) else ts(o.get("at")) or 0  # epoch or now()
+    busy = {run_of(o.get("owner"), ids) for _, o in lock_owners()
+            if isinstance(o, dict) and working(o.get("owner")) and time.time() - taken(o) < IDLE_RUN_SECS}
+    for r in active_runs():
+        if not r.get("id"):
+            continue
+        secs = idle_secs(RUNS / r["id"], r, busy)
+        if secs is not None and secs > IDLE_RUN_SECS:
+            idle[r["id"]] = secs
+    for rid, secs in idle.items():
+        if not a.run or rid == a.run:
+            lines.append(f"IDLE run {rid}: active, no active worker for {secs / 3600:.0f}h — resume it (orch spawn) "
+                         f"or end it (orch end-run --run {rid} --status aborted)")
     if not any_active_run() and not a.dry_run and caffeinate_release():
         lines.append("caffeinate released (no active runs)")
+    elif idle and len(idle) == len(active_runs()) and not a.dry_run and caffeinate_release():
+        lines.append("caffeinate released (every active run idle >12h; spawn takes it again)")
     if not any_active_run() and not a.keep_sim:
         msg = sims_down(dry=a.dry_run)
         if msg:
@@ -803,10 +964,19 @@ def cmd_end_run(a):
     if r.get("target", "").startswith("orch/"):
         git(r["repo"], "push", "--quiet", "origin", f":refs/heads/{r['target']}", check=False)
     if r.get("dash_ws"):
-        subprocess.run(["cmux", "workspace", "close", "--workspace", r["dash_ws"], "--force"], capture_output=True, text=True)
-    for x in (LOCKS / "ports").glob("*"):
-        if (read_json(x / "owner.json") or {}).get("owner", "").startswith(f"{a.run}-"):
-            shutil.rmtree(x, ignore_errors=True)
+        cmux("workspace", "close", "--workspace", r["dash_ws"], "--force", timeout=30)
+    g = r.get("group")
+    shared = g and any(x.get("group") == g or (r.get("coordinator_workspace") and x.get("coordinator_workspace")
+                                                 == r["coordinator_workspace"]) for x in active_runs(except_run=a.run))
+    if g and not shared and have_cmux():  # only workers + dashboard lived in it; members (the coordinator) stay
+        res = cmux("workspace-group", "ungroup", g)
+        print(f"group {g} dissolved" if res.returncode == 0 else f"orch: could not dissolve group {g}: "
+              f"{(res.stderr or res.stdout).strip()}")
+    (HOME / "state" / f"watch-{a.run}.json").unlink(missing_ok=True)
+    ids = [x.name for x in RUNS.glob("*")]
+    for x, o in lock_owners():  # everything still held under this run's names: ports, resources, merge, files
+        if run_of((o or {}).get("owner"), ids) == a.run:
+            steal_lock(x, o)
     r.update(status=a.status, ended=now())
     write_json(p, r)
     if not any_active_run():
@@ -833,6 +1003,7 @@ def cmd_broadcast(a):
     d = RUNS / a.run
     if not (d / "run.json").exists():
         sys.exit(f"orch: no run {a.run}")
+    need_cmux()
     sent, failed = [], []
     for _, wk in workers_of(d):
         if a.branch and wk.get("target") != a.branch:
@@ -883,6 +1054,8 @@ def cmd_note(a):
     d = RUNS / a.run
     if not (d / "run.json").exists():
         sys.exit(f"orch: no run {a.run}")
+    if (read_json(d / "run.json") or {}).get("status") == "active":
+        caffeinate_hold()  # the coordinator is back on this run (reap may have released it while idle)
     if a.plan:
         write_json(d / "plan.json", read_json(Path(a.plan)) or sys.exit(f"orch: bad plan file {a.plan}"))
     needs = add_need(d, a.wait) if a.wait else read_json(d / "waiting.json", [])
@@ -1008,6 +1181,7 @@ def _dash_frame(run):
 def cmd_dash(a):
     """Live terminal dashboard: redraws every --every seconds (Ctrl-C to quit)."""
     if a.open:
+        need_cmux()
         print(open_dash(a.run) or "orch: dashboard already open")
         return
     if a.once:
@@ -1026,18 +1200,22 @@ def open_dash(run):
     """Open the dashboard as its own workspace in the coordinator's group (once per run)."""
     d = RUNS / run
     r = read_json(d / "run.json") or sys.exit(f"orch: no run {run}")
-    live = cmux_live_workspaces() or set()
-    if r.get("dash_ws") and r["dash_ws"] in live:
+    live = cmux_live_workspaces()
+    if r.get("dash_ws") and (live is None or r["dash_ws"] in live):  # unknown liveness: never open a second one
         return None
     ws = r.get("coordinator_workspace")
     group = cmux_group_for(ws, run, f"{Path(r['repo']).name} · {r.get('title', run)}") if ws else None
-    args = ["cmux", "new-workspace", "--name", f"{run} dashboard", "--cwd", r["repo"],
+    if group and r.get("group") != group:
+        r["group"] = group
+    args = [CMUX, "new-workspace", "--name", f"{run} dashboard", "--cwd", r["repo"],
             "--command", f"{shlex.quote(str(Path(__file__).resolve()))} dash --run {shlex.quote(run)}", "--focus", "false"]
     if group:
         args += ["--group", group, "--group-placement", "afterCurrent", "--group-reference", ws]
-    out = subprocess.run(args, capture_output=True, text=True).stdout
+    out = cmux(*args[1:], timeout=30).stdout
     m = re.search(r"workspace:\d+", out)
     if not m:
+        if group:
+            write_json(d / "run.json", r)
         return f"orch: could not open dashboard: {out.strip()}"
     r["dash_ws"] = m.group(0)
     write_json(d / "run.json", r)
@@ -1250,29 +1428,107 @@ def merge_dir(path):
     return LOCKS / slug_of(path) / "merge"
 
 
-def cmd_merge_lock(a):
-    d, deadline = merge_dir(a.repo), time.time() + a.wait
-    d.parent.mkdir(parents=True, exist_ok=True)
-    while True:
+@contextlib.contextmanager
+def lock_guard():
+    """Exclusive flock serialising every take / steal / release of an orch lock dir (all orch processes, short hold)."""
+    LOCKS.mkdir(parents=True, exist_ok=True)
+    with open(LOCKS / ".guard", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
         try:
-            d.mkdir()
-            write_json(d / "owner.json", {"owner": a.owner, "workspace": cmux_workspace(), "at": time.time()})
-            print(f"merge lock held by {a.owner} — rebase, push, unlock; re-verify OUTSIDE the lock")
-            return
-        except FileExistsError:
-            o = read_json(d / "owner.json") or {}
-            if o.get("owner") == a.owner:
-                print("already held")
-                return
-            live = cmux_live_workspaces()
-            dead = live is not None and o.get("workspace") and o["workspace"] not in live
-            if dead or time.time() - o.get("at", 0) > MERGE_LOCK_MAX_SECS:
-                print(f"stealing stale merge lock from {o.get('owner')} ({'holder gone' if dead else 'expired'})")
-                shutil.rmtree(d, ignore_errors=True)
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def take_lock(d, info):
+    """Create lock dir `d` with owner.json already inside: built under a temp name, then renamed into place, so no
+    reader ever sees the lock without its owner. False if `d` exists (held, or an ownerless dir in its grace period).
+    The exists-check and rename run under lock_guard: a directory rename would silently replace an EMPTY `d`."""
+    d.parent.mkdir(parents=True, exist_ok=True)
+    with lock_guard():
+        if d.exists():
+            return False
+        tmp = None
+        try:
+            (LOCKS / ".tmp").mkdir(exist_ok=True)  # same filesystem as every lock dir, never matched by their globs
+            tmp = Path(tempfile.mkdtemp(prefix=f"{d.name}.", suffix=".tmp", dir=LOCKS / ".tmp"))
+            (tmp / "owner.json").write_text(json.dumps(info, indent=2))
+            os.rename(tmp, d)
+            return True
+        except OSError as e:
+            if d.exists():
+                return False
+            sys.exit(f"orch: could not create lock {d}: {e}")
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)  # gone already when the rename won
+
+
+def steal_lock(d, seen):
+    """Remove lock `d` only if it still holds exactly the owner.json that was judged (`seen`): under lock_guard nobody
+    can take or release it in between, so a lock retaken meanwhile is left alone. True if it was removed."""
+    with lock_guard():
+        if d.is_dir() and read_json(d / "owner.json") == seen:
+            shutil.rmtree(d, ignore_errors=True)
+            return True
+    return False
+
+
+def wait_lock(d, info, max_secs, wait, what, live_key):
+    """Take lock `d` for info["owner"], waiting up to `wait` secs. A holder is stale when its pane is gone, its lock is
+    older than max_secs, or the dir has had no owner.json for longer than LOCK_GRACE_SECS. Returns a message or None."""
+    deadline = time.time() + wait
+    while True:
+        if take_lock(d, {**info, "at": time.time()}):
+            return None
+        o = read_json(d / "owner.json")
+        if not isinstance(o, dict):
+            if not d.exists():
+                time.sleep(0.05)
+                continue  # released between the two looks
+            if dir_age(d) > LOCK_GRACE_SECS:
+                print(f"taking stale {what} (no owner.json for {int(dir_age(d))}s)")
+                steal_lock(d, o)
                 continue
-            if time.time() > deadline:
-                sys.exit(f"BUSY merge lock held by {o.get('owner')}")
-            time.sleep(5)
+            holder = "a taker still writing it (no owner.json yet)"
+        else:
+            if o.get("owner") == info["owner"]:
+                return "already held"
+            live = cmux_live_workspaces()
+            dead = live is not None and o.get(live_key) and o[live_key] not in live
+            if dead or time.time() - (o.get("at") or 0) > max_secs:
+                print(f"stealing stale {what} from {o.get('owner')} ({'holder gone' if dead else 'expired'})")
+                steal_lock(d, o)
+                continue
+            holder = o.get("owner")
+        if time.time() > deadline:
+            sys.exit(f"BUSY {what} held by {holder}")
+        time.sleep(5)
+
+
+def drop_lock(d, owner, force, what):
+    """Release lock `d` held by `owner`. A dir without owner.json may be mid-take: only --force removes it."""
+    if not d.exists():
+        return f"{what} not held"
+    o = read_json(d / "owner.json")
+    if not isinstance(o, dict):
+        if not force:
+            sys.exit(f"orch: {what} has no owner.json (being taken right now, or left by a crash) — "
+                     f"re-run with --force if you are sure nobody holds it")
+    elif o.get("owner") != owner:
+        sys.exit(f"orch: {what} held by {o.get('owner')}, not {owner}")
+    if not steal_lock(d, o):  # changed since we looked: released, or stolen as stale and retaken by someone else
+        if not d.exists():
+            return f"{what} not held"
+        sys.exit(f"orch: {what} changed while releasing it (now {(read_json(d / 'owner.json') or {}).get('owner')}); "
+                 f"nothing removed")
+    return None
+
+
+def cmd_merge_lock(a):
+    info = {"owner": a.owner, "workspace": cmux_workspace()}  # cmux runs before the lock exists, never inside it
+    msg = wait_lock(merge_dir(a.repo), info, MERGE_LOCK_MAX_SECS, a.wait, "merge lock", "workspace")
+    print(msg or f"merge lock held by {a.owner} — rebase, push, unlock; re-verify OUTSIDE the lock")
 
 
 RESOURCES = ("sim", "chrome")  # shared, one-at-a-time things: the iOS Simulator, the user's real Chrome
@@ -1281,46 +1537,76 @@ RESOURCE_MAX_SECS = 30 * 60
 
 def cmd_resource_lock(a):
     """Take a shared resource (sim / chrome); waits. Stale if the holder's pane is gone or >30 min."""
-    d, deadline = LOCKS / "resources" / a.name, time.time() + a.wait
-    d.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        try:
-            d.mkdir()
-            write_json(d / "owner.json", {"owner": a.owner, "surface": cmux_workspace(), "at": time.time()})
-            print(f"{a.name} held by {a.owner} — release with: orch resource-unlock --name {a.name} --owner {a.owner}")
-            return
-        except FileExistsError:
-            o = read_json(d / "owner.json") or {}
-            if o.get("owner") == a.owner:
-                print("already held")
-                return
-            live = cmux_live_workspaces()
-            dead = live is not None and o.get("surface") and o["surface"] not in live
-            if dead or time.time() - o.get("at", 0) > RESOURCE_MAX_SECS:
-                print(f"taking stale {a.name} lock from {o.get('owner')} ({'holder gone' if dead else 'expired'})")
-                shutil.rmtree(d, ignore_errors=True)
-                continue
-            if time.time() > deadline:
-                sys.exit(f"BUSY {a.name} held by {o.get('owner')}")
-            time.sleep(5)
+    info = {"owner": a.owner, "surface": cmux_workspace()}
+    msg = wait_lock(LOCKS / "resources" / a.name, info, RESOURCE_MAX_SECS, a.wait, f"{a.name} lock", "surface")
+    print(msg or f"{a.name} held by {a.owner} — release with: orch resource-unlock --name {a.name} --owner {a.owner}")
 
 
 def cmd_resource_unlock(a):
-    d = LOCKS / "resources" / a.name
-    o = read_json(d / "owner.json") or {}
-    if o.get("owner") not in (a.owner, None):
-        sys.exit(f"orch: {a.name} held by {o.get('owner')}, not {a.owner}")
-    shutil.rmtree(d, ignore_errors=True)
-    print(f"{a.name} released")
+    print(drop_lock(LOCKS / "resources" / a.name, a.owner, a.force, f"{a.name} lock") or f"{a.name} released")
 
 
 def cmd_merge_unlock(a):
-    d = merge_dir(a.repo)
-    o = read_json(d / "owner.json") or {}
-    if o.get("owner") not in (a.owner, None):
-        sys.exit(f"orch: merge lock held by {o.get('owner')}, not {a.owner}")
-    shutil.rmtree(d, ignore_errors=True)
-    print("merge lock released")
+    print(drop_lock(merge_dir(a.repo), a.owner, a.force, "merge lock") or "merge lock released")
+
+
+GC_KEEP = ("spec.md", "HANDOFF.md", "criteria.json", "plan.json", "run.json")
+
+
+def du(p):
+    """Bytes under p, never following symlinks."""
+    if p.is_symlink() or not p.is_dir():
+        return p.lstat().st_size
+    total = 0
+    for root, dirs, files in os.walk(p):
+        for f in dirs + files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except FileNotFoundError:
+                pass
+    return total
+
+
+def human(n):
+    for unit in ("B", "K", "M"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}G"
+
+
+def cmd_gc(a):
+    """Ended runs older than N days keep only spec/HANDOFF/criteria/plan/run.json (and lose their watch state)."""
+    m = re.fullmatch(r"(\d+)d", a.ended_older_than) or sys.exit("orch: --ended-older-than takes <N>d, e.g. 14d")
+    cutoff, total, lines = time.time() - int(m.group(1)) * 86400, 0, []
+    for d in sorted(RUNS.glob("*")):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        r = read_json(d / "run.json")
+        if not isinstance(r, dict) or r.get("status") in (None, "active"):
+            continue  # never an active run (or one we can't read)
+        ended = ts(r.get("ended"))
+        if ended is None or ended > cutoff:
+            continue
+        drop = [x for x in sorted(d.iterdir()) if x.name not in GC_KEEP]
+        watch = HOME / "state" / f"watch-{d.name}.json"
+        if watch.exists():
+            drop.append(watch)
+        if not drop:
+            continue
+        size = sum(du(x) for x in drop)
+        total += size
+        lines.append(f"{d.name}  {human(size):>7}  {', '.join(x.name for x in drop)[:100]}")
+        if not a.dry_run:
+            for x in drop:
+                if x.is_dir() and not x.is_symlink():
+                    shutil.rmtree(x, ignore_errors=True)
+                else:
+                    x.unlink(missing_ok=True)
+    if not lines:
+        return print(f"nothing to gc (no run ended more than {a.ended_older_than} ago with extra files)")
+    print("\n".join(lines))
+    print(f"{'would free' if a.dry_run else 'freed'} {human(total)} from {len(lines)} ended run(s)")
 
 
 def cmd_merged(a):
@@ -1360,7 +1646,7 @@ def main():
     p = argparse.ArgumentParser(prog="orch", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest="command", required=True)
     c = s.add_parser("new-run"); c.add_argument("--repo", default="."); c.add_argument("--title", required=True); c.add_argument("--coordinator"); c.add_argument("--coordinator-workspace")
-    c = s.add_parser("spawn"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--resume", action="store_true"); c.add_argument("--all-mcp", action="store_true", help="give the worker every MCP server"); c.add_argument("--native", action="store_true", help="slice needs the iOS Simulator (keeps cmux Computer Use)")
+    c = s.add_parser("spawn"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--resume", action="store_true"); c.add_argument("--all-mcp", action="store_true", help="give the worker every MCP server"); c.add_argument("--native", action="store_true", help="slice needs the iOS Simulator (keeps cmux Computer Use)"); c.add_argument("--dry-run", action="store_true", help="print what it would run; call neither cmux nor claude")
     c = s.add_parser("close"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done"); c.add_argument("--keep-worktree", action="store_true")
     c = s.add_parser("run-branch"); c.add_argument("--run", required=True)
     c = s.add_parser("baseline"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("--setup", help="e.g. 'npm ci'"); c.add_argument("--cmd", action="append", required=True)
@@ -1389,8 +1675,9 @@ def main():
     c = s.add_parser("gates-ok"); c.add_argument("--worktree", default="."); c.add_argument("--evidence", default=""); c.add_argument("--accept-failures")
     c = s.add_parser("merge-lock"); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True); c.add_argument("--wait", type=int, default=1800)
     c = s.add_parser("resource-lock"); c.add_argument("--name", required=True, choices=RESOURCES); c.add_argument("--owner", required=True); c.add_argument("--wait", type=int, default=1800)
-    c = s.add_parser("resource-unlock"); c.add_argument("--name", required=True, choices=RESOURCES); c.add_argument("--owner", required=True)
-    c = s.add_parser("merge-unlock"); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True)
+    c = s.add_parser("resource-unlock"); c.add_argument("--name", required=True, choices=RESOURCES); c.add_argument("--owner", required=True); c.add_argument("--force", action="store_true", help="also remove a lock dir with no owner.json")
+    c = s.add_parser("merge-unlock"); c.add_argument("--repo", default="."); c.add_argument("--owner", required=True); c.add_argument("--force", action="store_true", help="also remove a lock dir with no owner.json")
+    c = s.add_parser("gc"); c.add_argument("--ended-older-than", default="14d", help="<N>d (default 14d)"); c.add_argument("--dry-run", action="store_true", help="list what would go, with sizes")
     c = s.add_parser("merged"); c.add_argument("--repo", default="."); c.add_argument("--run"); c.add_argument("--slice"); c.add_argument("--branch"); c.add_argument("--sha", required=True); c.add_argument("--summary", default="")
     a = p.parse_args()
     if a.command == "lock" and not a.files:

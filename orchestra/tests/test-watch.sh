@@ -81,9 +81,11 @@ watch --run r2 --once; ok "finished (non-active) workers are not watched" '[ $rc
 
 echo "-- USAGE_LIMIT + auto-resume"
 mkrun r3 surface:90 S1:surface:11; tree surface:11:ttys1 surface:90:ttys9
-printf 'some output\n\n  ⎿  You'"'"'ve hit your limit · resets 3am (Asia/Kolkata)\n\n> \n' > $FX/screen-surface:11
+printf 'some output\n\n  ⎿  You'"'"'ve hit your limit · resets 3am (America/New_York)\n\n> \n' > $FX/screen-surface:11
 watch --run r3 --once
-ok "banner → EVENT USAGE_LIMIT S1 <reset at 21:30 UTC = 3am IST>" '[ $rc = 0 ] && [[ "$out" =~ ^"EVENT USAGE_LIMIT S1 "20[0-9-]+T21:30 ]]'
+day=$(sed -nE 's/^EVENT USAGE_LIMIT S1 (20[0-9-]+)T.*/\1/p' <<< "$out")   # 3am New York is the same UTC day
+want=$(date -u -r "$(TZ=America/New_York date -j -f '%Y-%m-%d %H:%M:%S' "$day 03:00:00" +%s)" +%Y-%m-%dT%H:%M 2>/dev/null)
+ok "banner → EVENT USAGE_LIMIT S1 <3am New York on that day, in UTC>" '[ $rc = 0 ] && [ -n "$want" ] && [ "$out" = "EVENT USAGE_LIMIT S1 $want" ]'
 reset=$(st r3 S1 reset_at); left=$(( $(date -j -f %Y-%m-%dT%H:%M "$reset" +%s) - $(date +%s) ))
 ok "reset_at recorded in watch state, next occurrence (0..24h ahead)" '[ $left -gt 0 ] && [ $left -le 86400 ]'
 touch -t $(date -v-30M +%Y%m%d%H%M) $ORCH_HOME/runs/r3/slices/S1.progress.md
@@ -110,7 +112,7 @@ ok "unparseable reset → now+60m" '[ $rc = 0 ] && [ $t -ge 3480 ] && [ $t -le 3
 echo "-- resend safety"
 setresumed(){ python3 -c 'import json,sys,time;p=sys.argv[1];d=json.load(open(p));d["S1"]["resumed_epoch"]=time.time()-int(sys.argv[2])*60;json.dump(d,open(p,"w"))' $ORCH_HOME/state/watch-$1.json $2; }
 setreset0(){ python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["S1"]["reset_epoch"]=0;json.dump(d,open(p,"w"))' $ORCH_HOME/state/watch-$1.json; }
-BAN='  ⎿  You'"'"'ve hit your limit · resets 3am (Asia/Kolkata)'
+BAN='  ⎿  You'"'"'ve hit your limit · resets 3am (America/New_York)'
 mkrun r6 surface:90 S1:surface:11; tree surface:11:ttys1 surface:90:ttys9; claude ttys1; : > $FX/sent.log
 printf 'out\n%s\n\n> \n' "$BAN" > $FX/screen-surface:11; watch --run r6 --once; setreset0 r6
 watch --run r6 --once; ok "resumed after reset" '[ "$out" = "EVENT RESUMED S1 $(st r6 S1 reset_at)" ] && [ $(wc -l < $FX/sent.log) = 2 ]'
