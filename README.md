@@ -18,16 +18,16 @@ flowchart TD
   AP --> SL["slices: file-owned, in waves<br/>(M = one slice)"]
   SL --> W["workers, each in its own worktree<br/>+ cmux workspace"]
   W --> G["tests first, then gates<br/>vs. the baseline"]
-  G --> R["review round: fresh reviewer + /code-review<br/>(+ adversarial reviewer on risky slices)"]
-  R -->|"blocking finding"| F["fix, re-gate, next round<br/>(cap 4 → oracle → BLOCKED)"] --> R
-  R -->|"clean round"| V["verifier runs it:<br/>tests fail on old code, pass on new;<br/>Playwright at 390px + desktop"]
+  G --> R["review round, agents by review tier:<br/>fresh reviewer + /code-review<br/>(+ adversarial reviewer on risky slices)"]
+  R -->|"blocking finding"| F["fix, re-gate, next round<br/>(cap 2 or 4 → oracle → BLOCKED)"] --> R
+  R -->|"clean full round"| V["verifier runs it:<br/>tests fail on old code, pass on new;<br/>Playwright at 390px + desktop"]
   V -->|"FAILURE"| F
   V -->|"PASS"| P["push-guard checks gates + verdicts<br/>on the exact commit"]
   P --> M["main<br/>(L: run branch → integration review → main)"]
 ```
 
-- **Tiers** keep small work cheap. S never starts a worker; M runs one worker that pushes straight to main; L runs the full `orchestrate` flow with up to 3 workers at a time, each pushing to a run branch `orch/<run>` that the coordinator reviews as a whole and pushes to main once.
-- **Review loop** (written once in `skills/worker/SKILL.md` §4–5). Each round reviews one gated, squashed commit. A **new** `reviewer` subagent (never shown earlier rounds) and Claude Code's built-in `/code-review` run in parallel; risky slices add an adversarial reviewer in round 1 and before the verifier. The reviewer's BLOCKING items always block; a `/code-review` finding blocks only if it is on lines the diff changes and causes a concrete failure. Blocking findings are fixed at the root cause (plus in-scope advisories), gates rerun, next round. A round with nothing blocking is clean: its advisories go to the report and the `verifier` runs. The same finding in two rounds in a row becomes a question for you; still blocking (or a verifier FAILURE) at round 4 → one `oracle` consult → BLOCKED, and you decide.
+- **Tiers** keep small work cheap. Task tier S never starts a worker; M runs one worker that pushes straight to main; L runs the full `orchestrate` flow with up to 3 workers at a time, each pushing to a run branch `orch/<run>` that the coordinator reviews as a whole and pushes to main once.
+- **Review loop** (written once in `skills/worker/SKILL.md` §4–5). Each round reviews one gated, squashed commit with **new** agents (never shown earlier rounds), picked by the slice's review tier (`lite`, `prose`, `code`, `risky`, `integration`): a `reviewer`, plus Claude Code's built-in `/code-review` for code, plus an adversarial reviewer when risky. Round 1 and the final round are full; rounds in between review only the cumulative fix diff plus the previous blockers. A `/code-review` finding blocks only if it is on lines the diff changes and causes a concrete failure. A clean full round runs the `verifier`. The same finding in two rounds in a row becomes a question for you; still blocking (or a verifier FAILURE) at the cap (2 rounds for lite and prose, 4 otherwise) → one `oracle` consult → BLOCKED, and you decide.
 - **Verification** is by running things: committed tests must fail on the old code and pass on the new; frontend changes get committed Playwright e2e specs on the worker's own dev-server ports; iOS native criteria get Maestro flows on a per-worker Simulator clone.
 - **Supervision** is event-driven: the coordinator wakes on worker messages, `orch-watch` events (dead, stalled, usage limit hit/resumed) or a 30-minute heartbeat. A live dashboard workspace shows what needs you.
 
@@ -98,7 +98,7 @@ While it runs: answer the questions it asks (each comes with a recommended answe
 | skill | `diagnosing-bugs` | A diagnosis loop for hard bugs and performance regressions. |
 | skill | `retro` | `/retro`: a retrospective on a session — misses and the rule, test or hook that prevents each. |
 | skill | `writing-for-agents` | How to write skills and `CLAUDE.md` files that agents follow. |
-| agent | `reviewer` | Fresh-eyes code review from only the criteria and a git range; records its own verdict. Modes: full, adversarial, lite (tier S). |
+| agent | `reviewer` | Fresh-eyes code review from only the criteria and a git range; records its own verdict. Modes: full, re-review (middle rounds), adversarial, lite. |
 | agent | `verifier` | Proves the change works by running it (tests, Playwright, Maestro, emulators); records per-criterion results. |
 | agent | `oracle` | Read-only second opinion when a worker is stuck. |
 | agent | `ci-monitor` | Watches GitHub Actions for one pushed commit and reports one PASS/FAIL line. |
@@ -127,7 +127,7 @@ More on the commands: [orchestra/README.md](orchestra/README.md).
 
 ## Token cost
 
-This trades tokens for quality. An L run starts several Opus sessions (coordinator + up to 3 workers), and every review round adds a reviewer, a `/code-review` agent and, at the end, a verifier. A typical feature can use many times the tokens of doing it in one chat. Use `/new-task` and let triage pick S or M when the task is small. Each worker also uses about 1 GB of memory.
+This trades tokens for quality. An L run starts several Opus sessions (coordinator + up to 3 workers), and every review round adds a reviewer, `/code-review` (code slices) and, at the end, a verifier. A typical feature can use many times the tokens of doing it in one chat. Use `/new-task` and let triage pick S or M when the task is small. Each worker also uses about 1 GB of memory.
 
 ## Uninstall
 
@@ -153,7 +153,7 @@ From the clone. It removes every file the installer copied and restores what it 
 
 **A push was denied.** Read the reason: push-guard names what's missing (gates, a verdict on this commit, the merge lock, a rebase). Fix that; never work around it.
 
-**A worker is BLOCKED.** It hit the 4-round cap or a question only you can answer. The coordinator asks you: restart fresh (from the worker's `## Learned` notes), re-scope, or drop the slice.
+**A worker is BLOCKED.** It hit its 2- or 4-round cap or a question only you can answer. The coordinator asks you: restart fresh (from the worker's `## Learned` notes), re-scope, or drop the slice.
 
 **Where is the state?** `~/.claude/orchestra/runs/<run>/` holds the spec, criteria, briefs, progress files, artifacts and screenshots.
 

@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Protocol for an orchestra worker session — implement one slice in its own worktree, pass gates, run fresh review rounds until reviewer, /code-review and verifier pass on the exact commit, rebase, push to the run's target branch, and report to the coordinator. Invoked by the coordinator as `/worker <brief path>`; not for direct use.
+description: Protocol for an orchestra worker session — implement one slice in its own worktree, pass gates, run fresh review rounds sized by the slice's review tier until they and the verifier pass on the exact commit, rebase, push to the run's target branch, and report to the coordinator. Invoked by the coordinator as `/worker <brief path>`; not for direct use.
 argument-hint: <path to slice brief>
 disable-model-invocation: true
 ---
@@ -33,28 +33,42 @@ Read the brief at `$ARGUMENTS` first: RUN, ID, OWNER=`$RUN-$ID`, coordinator wor
 `$ORCH gates --cmd "<gate 1>" --cmd "<gate 2>" ... --cmd "gitleaks git --no-banner --log-opts=origin/$T..HEAD"`.
 A failure that is also in the run's `baseline.json` (and not flaky-new) is pre-existing; anything else you fix. A failing test you suspect is flaky: rerun once; still flaky → note it, don't "fix" it with retries.
 
-## 4. Review rounds — fresh eyes every round, on the exact commit
-A round reviews one gated, squashed HEAD. When it ends, append `step 4 round <n> — PASS | BLOCK: <file — defect | Cn — failure>; …` to `$PROG`.
-1. **Launch in one message, in the background**, all new agents given only brief items, never your reasoning or earlier findings:
-   - `reviewer`, mode `full`: worktree, range `origin/$T..HEAD`, criteria, out-of-scope, the spec's Decisions plus every answer to your QUESTIONs.
-   - a `general-purpose` agent that runs the `code-review` skill with args `high origin/$T..HEAD` in the worktree (no `--fix`/`--comment`) and returns only its findings.
-   - risky slices, round 1 only: `reviewer`, mode `adversarial`, same brief.
+## 4. Review rounds — fresh agents every round, on the exact commit
+A round reviews one gated, squashed HEAD. When it ends, append `step 4 round <n> <full|middle> — PASS | BLOCK: <file — defect | Cn — failure>; …` to `$PROG`.
+
+**Review tiers** (not the task tiers S/M/L of `/new-task`) — the brief's `Review:` picks the agents, and a risky slice is always `risky`; this table is their only copy:
+
+| review tier | full rounds | middle rounds | cap |
+|---|---|---|---|
+| lite (≤~30 lines, ≤3 files, not risky) | `reviewer` lite | — | 2 |
+| prose (no code or test files changed) | `reviewer` full; `/code-review` in round 1 at most | — | 2 |
+| code | `reviewer` full + `/code-review` | `reviewer` re-review | 4 |
+| risky | `reviewer` full + `/code-review` + `reviewer` adversarial | `reviewer` re-review + `/code-review` | 4 |
+| integration | all three, full | — | 4 |
+
+**Full or middle.** A round is **full** when it is round 1, follows a clean middle round (same HEAD), is the cap round, or the review tier has no middle rounds. Any other round (after a block or verifier FAILURE) is **middle**: it reviews the cumulative fix diff since the round-1 HEAD (`<round-1 sha>..HEAD`) plus the previous round's blocking items; findings outside that diff are advisory. Only a clean full round ends the loop. A restarted slice starts again at round 1. A rebase that changes HEAD makes the next round full, and that round's HEAD is the round-1 sha for later middle rounds.
+1. **Launch in one message**, every agent new and given only brief items, never your reasoning or earlier findings:
+   - `reviewer` in the table's mode: worktree, range `origin/$T..HEAD`, criteria, out-of-scope, the spec's Decisions plus every answer to your QUESTIONs, and the gate record `<git dir>/orchestra-gates-run.json` (the HEAD it ran on + each gate's log path, as `orch gates` printed them). Middle rounds add the round-1 sha and the previous blocking items verbatim; lite adds the proving command (the exact command running your criteria's tests).
+   - `/code-review`: invoke the `code-review` skill directly (it runs forked; no wrapper agent) in the worktree with args `high origin/$T..HEAD` (middle: `high <round-1 sha>..HEAD`), no `--fix`/`--comment`.
+   - adversarial: the reviewer's brief, mode `adversarial`.
 2. **Classify** each `/code-review` finding; reviewer and adversarial BLOCKING items stay blocking.
-   - **blocking**: the reviewer's bar (quoted line + concrete failure scenario) on lines this diff changes, needing at most one unusual condition;
+   - **blocking**: the reviewer's bar (quoted line + concrete failure scenario: a wrong result, crash, hang, fail-open or data loss on a real path) on lines this diff changes (middle: the fix diff), needing at most one unusual condition;
    - **advisory**: pre-existing behaviour, lines this diff doesn't change, or several unusual conditions at once;
    - **rejected**: disproved by quoting the code, or contradicts a recorded Decision (cite it). Report every rejection with quote + reason.
    Nothing is recorded for `/code-review`; reviewer PASS stays the push gate.
-3. **Any blocking → §5.** Otherwise it is clean; advisories go to the report. Risky and no adversarial PASS on this HEAD → a new `adversarial` reviewer first (BLOCK → §5). Then `verifier` (mode full): worktree, run id, base `origin/$T`, criteria with check notes, type, native flag + the brief's native recipe and memory file paths, owner name, dev-server/emulator commands + your ports (`$ORCH_PORT..$ORCH_PORT_END` — give the numbers), gate commands, test accounts, artifacts dir, Repro. PASS → §6; FAILURE → §5.
+3. **Any blocking → §5.** A clean middle round → the full round on the same HEAD. A clean full round → its advisories go to the report, then `verifier` (mode full): worktree, run id, base `origin/$T`, criteria with check notes, type, native flag + the brief's native recipe and memory file paths, owner name, dev-server/emulator commands + your ports (`$ORCH_PORT..$ORCH_PORT_END` — give the numbers), gate commands + the gate record, test accounts, artifacts dir, Repro. PASS → §6; FAILURE → §5.
 
 ## 5. Fix, then the next round
 First match wins:
-1. **Cap**: blocking or FAILURE in round 4 or later → consult `oracle` once (goal, failing evidence, diff, what you tried), write `## Learned` in `$PROG` (each round's blockers, what was tried, why it failed, oracle's view), send `BLOCKED: <one line>`, end your turn.
+1. **Cap**: blocking or FAILURE in the review tier's cap round or later → consult `oracle` once (goal, failing evidence, diff, what you tried), write `## Learned` in `$PROG` (each round's blockers, what was tried, why it failed, oracle's view), send `BLOCKED: <one line>`, end your turn.
 2. **Repeat**: same defect as the previous round's line → `QUESTION: <file — defect> in rounds <n-1> and <n>; tried: <what>`, end your turn; apply the answer in 5.3.
-3. **Fix** every blocking finding and FAILURE at the root cause, plus every advisory inside your Touches. Re-squash, re-gate (§3), next round from 4.1.
+3. **Fix** every blocking finding and FAILURE at the root cause, plus every advisory inside your Touches. **No widening**: a fix that adds an exemption, allow or default needs a test of that same input, watched failing first. Re-squash, re-gate (§3), next round from 4.1. A lite BLOCK "re-tier" → `QUESTION: re-tier as code?`, end your turn.
+
+A defect that predates your diff on lines it touches → `QUESTION: fix-slice candidate — <file:line — defect>` at once (never only in MERGED), then carry on.
 
 ## 6. Integrate — the merge lock covers only rebase + push
-1. **Sync**: `git fetch origin && git rebase origin/$T`. Conflicts: keep both sides' intent; regenerate lock/generated files. If HEAD changed: re-run gates, then patch unchanged → verifier in `specs-only` mode (reviewer verdicts carry over); conflicts resolved or upstream touched your files (the patch changed) → the next round from 4.1. Verifier FAILURE → §5.
-2. `$ORCH gates-ok --evidence "<gate summary; round <n>: reviewer PASS, /code-review clean, verifier PASS>"` (it refuses unless gates + verdicts match HEAD).
+1. **Sync**: `git fetch origin && git rebase origin/$T`. Conflicts: keep both sides' intent; regenerate lock/generated files. If HEAD changed: re-run gates, then patch unchanged → verifier in `specs-only` mode (reviewer verdicts carry over); conflicts resolved or upstream touched your files (the patch changed) → a full round from 4.1. Verifier FAILURE → §5.
+2. `$ORCH gates-ok --evidence "<gate summary; round <n>: the review tier's agents clean, verifier PASS>"` (it refuses unless gates + verdicts match HEAD).
 3. `$ORCH merge-lock --repo . --owner $OWNER` **as its own Bash call** (push-guard checks the lock before a command runs) → `git fetch origin`; if `origin/$T` moved since step 1: `$ORCH merge-unlock --repo . --owner $OWNER` and go back to 6.1. Otherwise `git push origin HEAD:$T` (the push-guard re-checks everything).
 4. `$ORCH merged --sha $(git rev-parse HEAD) --summary "<one line>"` then `$ORCH merge-unlock --repo . --owner $OWNER`. Stop your dev server/emulators.
 5. Report: `MERGED: <sha> — <summary>. Gates: <vs baseline>. Rounds: <n>. Reviewer: PASS. /code-review rejected: <file — quote — reason|none>. Advisories (unfixed): <list|none>. Verifier: PASS (<key evidence/screenshot paths>). Flaky: <list|none>. Not exercised: <list|none>.` End your turn; the coordinator closes your workspace.

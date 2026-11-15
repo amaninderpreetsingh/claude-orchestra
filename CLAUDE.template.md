@@ -10,8 +10,8 @@ A repo's own `CLAUDE.md` wins over these rules (commit format, trailers, dev-ser
 - A bug report that already names the root cause and the files is tier S or M (one worker), never a multi-slice run.
 
 ## Quality bar (never traded for speed)
-- Every change gets gates (typecheck on the real project config, lint, tests, build) compared to the baseline counts, and a fresh-eyes review loop: each round a new `reviewer` plus `/code-review`, fixes, re-gate, until a clean round (capped at 4 rounds, then the `oracle`, then I decide).
-- Tier M and L also need a `verifier` PASS on the exact commit that ships — frontend: Playwright at 390px and desktop; backend: real tests plus emulator/API calls. Tier S has a lite reviewer run its proving command instead, no verifier.
+- Every change gets gates (typecheck on the real project config, lint, tests, build) compared to the baseline counts, and a fresh-eyes review loop sized by review tier (`~/.claude/skills/worker/SKILL.md` §4): each round new reviewers, fixes, re-gate, until a clean full round (capped at 2 or 4 rounds, then the `oracle`, then I decide).
+- Every worker slice also needs a `verifier` PASS on the exact commit that ships — frontend: Playwright at 390px and desktop; backend: real tests plus emulator/API calls. A `/new-task` S change has a lite reviewer run its proving command instead, no verifier.
 - Verify yourself; don't ask me to. Report verified vs. not-exercised separately; never "should work".
 - Root cause before fixes. After ~3 failed attempts, stop and rethink with me.
 - Match the repo's patterns. No speculative abstraction, no drive-by refactors.
