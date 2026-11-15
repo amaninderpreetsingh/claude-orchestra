@@ -14,7 +14,7 @@ cat > $S/bin/cmux <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
   tree) cat "$FX/tree.json" 2>/dev/null || exit 1 ;;
-  read-screen) while [ $# -gt 0 ]; do [ "$1" = --surface ] && ref=$2; shift; done; cat "$FX/screen-$ref" 2>/dev/null
+  read-screen) while [ $# -gt 0 ]; do case "$1" in --surface|--workspace) ref=$2 ;; esac; shift; done; cat "$FX/screen-$ref" 2>/dev/null
     [ -e "$FX/screen-$ref.then" ] && mv "$FX/screen-$ref.then" "$FX/screen-$ref"; true ;;
   send|send-key) [ -e "$FX/send-fails" ] && exit 1; [ "$1" = send-key ] && [ -e "$FX/key-fails" ] && exit 1; echo "$*" >> "$FX/sent.log" ;;
   *) exit 1 ;;
@@ -213,5 +213,62 @@ EOF
 chmod +x $S/hang/cmux; rm -f $ORCH_HOME/state/watch-r7.json
 t0=$(date +%s); out=$(PATH=$S/hang:$PATH $W --run r7 --once 2>&1); rc=$?; el=$(( $(date +%s) - t0 ))
 ok "hung cmux: one tree timeout per poll, not two (${el}s)" '[ $el -lt 18 ]'
+
+echo "-- stable ids: the coordinator, and records that hold only a short ref"
+# ctree <surface:11 id> <surface:90 id> [workspace:1 id] — ids "" are left out (a ref the tree lists without a uuid)
+ctree(){ python3 - "$@" > $FX/tree.json <<'EOF'
+import json, sys
+def node(ref, uid, **kw):
+    n = {"ref": ref, **kw}
+    if uid: n["id"] = uid
+    return n
+a = sys.argv[1:] + ["", "", ""]
+s = [node("surface:11", a[0], tty="ttys1"), node("surface:90", a[1], tty="ttys9")]
+print(json.dumps({"windows": [{"workspaces": [node("workspace:1", a[2], panes=[{"ref": "pane:1", "surfaces": s}])]}]}))
+EOF
+}
+reset0(){ python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d[sys.argv[2]]["reset_epoch"]=0;json.dump(d,open(p,"w"))' $ORCH_HOME/state/watch-$1.json $2; }
+rm -f $FX/screen-*; claude ttys1; claude ttys9
+mkrun r11 surface:90; ctree "" C-OWN; : > $FX/sent.log
+printf 'out\n  ⎿  You'"'"'ve hit your limit · resets 11pm\n\n> \n' > $FX/screen-C-OWN; : > $FX/screen-surface:90
+watch --run r11 --once --coordinator; ok "coordinator's short ref resolved to its uuid: screen read by the uuid → USAGE_LIMIT coordinator" '[ $rc = 0 ] && [[ "$out" =~ ^"EVENT USAGE_LIMIT coordinator "20[0-9-]+T23:00$ ]]'
+reset0 r11 coordinator
+watch --run r11 --once --coordinator; ok "coordinator auto-continue after the reset: 'continue' + Enter typed into its uuid" '[ $rc = 0 ] && [[ "$out" == "EVENT RESUMED coordinator "* ]] && grep -q "^send --surface C-OWN continue$" $FX/sent.log && grep -q "^send-key --surface C-OWN enter$" $FX/sent.log && [ $(wc -l < $FX/sent.log) = 2 ]'
+ctree "" C-OTHER; cp $FX/screen-C-OWN $FX/screen-surface:90; cp $FX/screen-C-OWN $FX/screen-C-OTHER
+watch --run r11 --once --coordinator; ok "resolved once: surface:90 reused by another surface → DEAD coordinator, nothing typed into it" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD coordinator surface-gone surface:90" ] && [ $(wc -l < $FX/sent.log) = 2 ]'
+
+mkrun r12 surface:90; ctree; : > $FX/sent.log; rm -f $FX/screen-*      # a cmux that lists no uuids: the ref, as before
+printf 'out\n  ⎿  You'"'"'ve hit your limit · resets 11pm\n\n> \n' > $FX/screen-surface:90
+watch --run r12 --once --coordinator; ok "short-ref fallback: tree without uuids → coordinator read by its ref" '[ $rc = 0 ] && [[ "$out" == "EVENT USAGE_LIMIT coordinator "* ]]'
+reset0 r12 coordinator
+watch --run r12 --once --coordinator; ok "short-ref fallback: auto-continue typed into the ref" '[ $rc = 0 ] && [[ "$out" == "EVENT RESUMED coordinator "* ]] && grep -q "^send --surface surface:90 continue$" $FX/sent.log'
+ctree "" C-LATE
+watch --run r12 --once --coordinator; ok "...a later tree with uuids resolves the ref then (no false DEAD)" '[[ "$out" != *DEAD* ]] && [ "$(st r12 coordinator id)" = C-LATE ]'
+rm $FX/tree.json; rm -f $ORCH_HOME/state/watch-r12.json
+watch --run r12 --once --coordinator; ok "cmux unreadable → coordinator read by its ref, not DEAD" '[[ "$out" != *DEAD* ]] && [ -z "$(st r12 coordinator id)" ]'
+
+mkrun r13 surface:90 S1:surface:11; ctree W-OWN C-OWN; : > $FX/sent.log; rm -f $FX/screen-*   # worker record without surface_id
+printf 'out\n  ⎿  You'"'"'ve hit your limit · resets 11pm\n\n> \n' > $FX/screen-W-OWN
+watch --run r13 --once; ok "worker with only a short ref: resolved to its uuid, banner read there" '[ $rc = 0 ] && [[ "$out" == "EVENT USAGE_LIMIT S1 "* ]]'
+reset0 r13 S1
+watch --run r13 --once; ok "...auto-continue typed into the worker's uuid" '[ $rc = 0 ] && [[ "$out" == "EVENT RESUMED S1 "* ]] && grep -q "^send --surface W-OWN continue$" $FX/sent.log'
+ctree W-OTHER C-OWN
+watch --run r13 --once; ok "...its ref reused later → DEAD S1" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD S1 surface-gone surface:11" ]'
+
+mkrun r14 surface:90 S1:workspace:1; ctree W-FIRST C-OWN WS-ONE; : > $FX/sent.log; rm -f $FX/screen-*  # a workspace ref: its own uuid
+printf 'out\n  ⎿  You'"'"'ve hit your limit · resets 11pm\n\n> \n' > $FX/screen-WS-ONE
+watch --run r14 --once; ok "worker recorded as workspace:N → the workspace's uuid, read with --workspace" '[ $rc = 0 ] && [[ "$out" == "EVENT USAGE_LIMIT S1 "* ]] && [ "$(st r14 S1 id)" = WS-ONE ]'
+reset0 r14 S1; rm $FX/tree.json
+watch --run r14 --once; ok "...cmux tree unreadable: the stored uuid is still the address (continue + Enter into --workspace WS-ONE)" '[ $rc = 0 ] && [[ "$out" == "EVENT RESUMED S1 "* ]] && grep -q "^send --workspace WS-ONE continue$" $FX/sent.log && grep -q "^send-key --workspace WS-ONE enter$" $FX/sent.log'
+
+mkrun r15 surface:90; : > $FX/sent.log; rm -f $FX/screen-*   # run.json records the coordinator's uuid; its ref is already reused
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["coordinator_id"]="C-REC";json.dump(d,open(p,"w"))' $ORCH_HOME/runs/r15/run.json
+ctree C-REC C-OTHER; printf 'out\n  ⎿  You'"'"'ve hit your limit · resets 11pm\n\n> \n' > $FX/screen-C-REC; cp $FX/screen-C-REC $FX/screen-C-OTHER
+watch --run r15 --once --coordinator; ok "run.json coordinator_id is the address even when the short ref names someone else" '[ $rc = 0 ] && [[ "$out" == "EVENT USAGE_LIMIT coordinator "* ]]'
+reset0 r15 coordinator
+watch --run r15 --once --coordinator; ok "...auto-continue typed into coordinator_id, never into the reused ref" '[ $rc = 0 ] && [[ "$out" == "EVENT RESUMED coordinator "* ]] && grep -q "^send --surface C-REC continue$" $FX/sent.log && ! grep -q "C-OTHER\|surface:90" $FX/sent.log'
+
+mkrun r16 surface:90 S1:surface:12; ctree "" C-OWN; rm -f $FX/screen-*   # S1 is dead: the poll returns DEAD S1 first
+watch --run r16 --once --coordinator; ok "an earlier target's event still lets the coordinator's ref be resolved that poll" '[ "$out" = "EVENT DEAD S1 surface-gone surface:12" ] && [ "$(st r16 coordinator id)" = C-OWN ]'
 
 echo; echo "PASSED $PASS  FAILED $FAIL"; [ $FAIL = 0 ]

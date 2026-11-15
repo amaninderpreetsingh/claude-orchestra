@@ -3,7 +3,8 @@
 
     orch-watch --run R [--once] [--interval SECS] [--timeout SECS] [--stall-min M] [--coordinator]
 
-Polls the run's active workers (and, with --coordinator, the run's coordinator surface). On the
+Polls the run's active workers (and, with --coordinator, the run's coordinator surface), each by its stable cmux
+uuid (a short surface:N/workspace:N in the records is resolved to it once; the ref when cmux lists none). On the
 first event prints one line `EVENT <kind> <slice> <detail>` and exits 0; exits 3 when the timeout
 passes (or after one poll with --once) with no event. Kinds:
   DEAD         surface gone from `cmux tree`, or no claude process left on its tty
@@ -63,32 +64,48 @@ def cmux(*args):
 
 
 def live_surfaces():
-    """{ref or uuid: tty} for every live workspace/surface, or None when cmux can't tell (→ nobody is dead).
-    A short ref (surface:N) is reused once its surface closes; the uuid (`--id-format both`) is stable."""
+    """({ref or uuid: tty} for every live workspace/surface, {ref: stable uuid}), or (None, {}) when cmux can't tell
+    (→ nobody is dead). A short ref (surface:N) is reused once its surface closes; the uuid (`--id-format both`) is
+    stable."""
     rc, out = cmux_rc("tree", "--all", "--json", "--id-format", "both")
     if rc not in (0, 124, 127):  # a cmux from before --id-format: refs only (hung or missing: no second try)
         rc, out = cmux_rc("tree", "--all", "--json")
     if rc != 0:
-        return None
+        return None, {}
     try:
         tree = json.loads(out)
     except Exception:
-        return None
-    live = {}
+        return None, {}
+    live, uid_of = {}, {}
     def walk(o):
         if isinstance(o, dict):
             ref = str(o.get("ref", ""))
             if ref.startswith(("workspace:", "surface:")):
                 live[ref] = o.get("tty")
-                if isinstance(o.get("id"), str) and o["id"]:
-                    live[o["id"]] = o.get("tty")
+                uid = o.get("id") if isinstance(o.get("id"), str) and o["id"] else None
+                if uid:
+                    live[uid], uid_of[ref] = o.get("tty"), uid
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
             for v in o:
                 walk(v)
     walk(tree)
-    return live
+    return live, uid_of
+
+
+def resolve(t, e, uid_of):
+    """The target's stable id: the one its record holds, else the one its short ref was resolved to on first sight
+    (kept in the watch state, so a later reuse of the ref by another surface reads as DEAD, never as this target),
+    else resolve it now. None when cmux can't resolve it (no uuids listed, or the ref isn't in the tree): the ref."""
+    if t.get("id"):
+        return t["id"]
+    if e.get("id") and e.get("id_of") == t["ref"]:
+        return e["id"]
+    uid = uid_of.get(t["ref"])
+    if uid:
+        e.update(id=uid, id_of=t["ref"])
+    return uid
 
 
 def claude_gone(tty):
@@ -153,13 +170,16 @@ def local_iso(epoch):
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%dT%H:%M")
 
 
-def check(t, e, live, a, now):
+def check(t, e, live, a, now, uid_of):
     """Event (kind, detail) for target t, updating its watch-state entry e in place; None if nothing new."""
     ref = t["ref"]  # shown in events
-    # read/typed into: the surface's uuid when spawn recorded one, never a reused surface:N — unless this cmux lists
-    # no uuids at all (then the ref, as before ids)
+    # read/typed into: the surface's stable uuid (recorded by spawn, or resolved from the short ref once), never a
+    # reused surface:N — unless this cmux lists no uuids at all (then the ref, as before ids). A recorded id is a
+    # surface's (spawn's surface_id, run.json's coordinator_id); one resolved from a ref names what the ref named
     ids = not live or any(not k.startswith(("workspace:", "surface:")) for k in live)  # as orch's has_ids
-    addr = t.get("id") if t.get("id") and ids else ref
+    uid = resolve(t, e, uid_of)
+    addr = uid if uid and ids else ref
+    fl = "--surface" if t.get("id") and addr == t["id"] else flag(ref)
     dead = None
     if live is not None:
         if addr not in live:
@@ -167,7 +187,7 @@ def check(t, e, live, a, now):
         elif live[addr] and claude_gone(live[addr]):
             dead = "no-claude"
     def become(kind, **kw):  # new state; the last resume (time + banner) survives (stall clock restarts at a resume)
-        kept = {k: e[k] for k in ("resumed_epoch", "resumed_banner") if k in e and k not in kw}
+        kept = {k: e[k] for k in ("resumed_epoch", "resumed_banner", "id", "id_of") if k in e and k not in kw}
         e.clear(); e.update(kind=kind, **kw, **kept)
 
     if dead:
@@ -176,7 +196,7 @@ def check(t, e, live, a, now):
         become("DEAD")
         return "DEAD", f"{dead} {ref}"
     def screen_banner():
-        return banner_text(cmux("read-screen", flag(addr), addr, "--lines", "40"))
+        return banner_text(cmux("read-screen", fl, addr, "--lines", "40"))
     hit = screen_banner()
     banner = hit and hit[0]
     if e.get("resumed_banner") and banner != e["resumed_banner"]:
@@ -195,10 +215,10 @@ def check(t, e, live, a, now):
             # cmux send fails (sends nothing) when the prompt holds text or a dialog is open → retry next poll;
             # once "continue" is typed, a failed Enter is retried alone (typing it again would fail on the held text)
             if not e.get("typed"):
-                if cmux("send", flag(addr), addr, "continue") is None:
+                if cmux("send", fl, addr, "continue") is None:
                     return None
                 e["typed"] = True
-            if cmux("send-key", flag(addr), addr, "enter") is None:
+            if cmux("send-key", fl, addr, "enter") is None:
                 return None
             e.pop("typed")
             e.update(kind="RESUMED", resumed_epoch=now, resumed_banner=banner)
@@ -235,16 +255,19 @@ def targets(run_dir, r, a):
         out.append({"name": wk["slice"], "ref": wk["workspace"], "id": wk.get("surface_id"), "started": started,
                     "progress": run_dir / "slices" / f"{wk['slice']}.progress.md"})
     if a.coordinator and r.get("coordinator"):
-        out.append({"name": "coordinator", "ref": r["coordinator"]})
+        out.append({"name": "coordinator", "ref": r["coordinator"], "id": r.get("coordinator_id")})
     return out
 
 
 def poll(run_dir, r, a, state_path):
     state = read_json(state_path, {})
-    live, now, event = live_surfaces(), time.time(), None
-    for t in targets(run_dir, r, a):
-        e = state.setdefault(t["name"], {})
-        hit = check(t, e, live, a, now)
+    (live, uid_of), now, event = live_surfaces(), time.time(), None
+    ts = targets(run_dir, r, a)
+    for t in ts:  # every short ref is resolved this poll, even past the target that returns the event
+        resolve(t, state.setdefault(t["name"], {}), uid_of)
+    for t in ts:
+        e = state[t["name"]]
+        hit = check(t, e, live, a, now, uid_of)
         if hit:
             event = f"EVENT {hit[0]} {t['name']} {hit[1]}"
             break
