@@ -43,7 +43,7 @@ echo "-- push-guard.py doesn't load with the found python3: explain, exit 1, wri
 mkdir -p "$S/srcpy"; for f in install.sh uninstall.sh settings.example.json CLAUDE.template.md skills agents orchestra statusline; do cp -R "$ROOT/$f" "$S/srcpy/"; done
 python3 - "$S/srcpy/orchestra/hooks/push-guard.py" <<'PY'
 import sys
-p = sys.argv[1]; s = open(p).read(); a = "\nimport codecs, re,"
+p = sys.argv[1]; s = open(p).read(); a = "\nimport json, re,"
 assert a in s
 open(p, "w").write(s.replace(a, '\nraise SyntaxError("needs a newer Python")' + a, 1))  # as (?>…) failed on 3.9
 PY
