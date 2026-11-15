@@ -344,7 +344,7 @@ ok "demo repo created" '[ $rc = 0 ] && [ -f "$S/demo1/app/package.json" ] && [ -
 ok "no cmux call with --no-launch" '[ ! -e "$S/cmux.log" ]'
 echo "-- the demo dev server serves only its app dir, on loopback only"
 if command -v node >/dev/null; then
-  DP=$((40000 + $$ % 2000 * 10)); echo secret > "$S/demo1/outside.txt"
+  DP=${ORCH_TEST_PORT_BASE:-$((40000 + $$ % 2000 * 10))}; echo secret > "$S/demo1/outside.txt"
   (cd "$S/demo1/app" && PORT=$DP exec node server.js >/dev/null 2>&1) & DS=$!
   for i in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$DP/" && break; sleep 0.1; done
   code(){ curl -s --path-as-is -o "$S/dbody" -w '%{http_code}' "http://127.0.0.1:$DP$1"; }
