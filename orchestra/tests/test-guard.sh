@@ -330,4 +330,35 @@ ok "…finishes well under the hook timeout (${el}s ≤ 15s)" '[ $el -le 15 ]'
 s0=$(date +%s); t $W "$(cat $S/big.txt)" 2 "the same command from a worker → deny"; el=$(( $(date +%s) - s0 ))
 ok "…also fast (${el}s ≤ 15s)" '[ $el -le 15 ]'
 
+echo "-- C4: the hook command settings.example.json installs fails closed when the guard can't run (hook exit 1 = allowed)"
+HOOKCMD=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([h["command"] for e in d["hooks"]["PreToolUse"] if e["matcher"]=="Bash" for h in e["hooks"] if "push-guard.py" in h["command"]][0])' "$ROOT/../settings.example.json")
+ok "settings.example.json has the push-guard hook command" '[ -n "$HOOKCMD" ]'
+FH=$S/fakehome; mkdir -p $FH/.claude/orchestra/hooks $S/nopy
+# hc <guard file to install as push-guard.py, or none> <cwd> <command> <want exit> <label> [shell] [PATH]: runs the exact
+# command string with HOME=$FH, as Claude Code does (a shell; JSON on stdin); a no-decision must also print nothing
+hc(){ rm -f $FH/.claude/orchestra/hooks/push-guard.py; [ "$1" = none ] || cp "$1" $FH/.claude/orchestra/hooks/push-guard.py
+  out=$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" \
+        | (cd "$2" && HOME=$FH hard env PATH="${7:-$PATH}" ${6:-/bin/sh} -c "$HOOKCMD" 2>&1)); r=$?
+  if [ $r = $4 ] && { [ $r = 2 ] || [ -z "$out" ]; }; then P=$((P+1)); echo "ok   $5"; else F=$((F+1)); echo "FAIL $5 (got $r) $out"; fi; }
+cp $H $S/pg-syntax.py; printf '\ndef broken(:\n' >> $S/pg-syntax.py
+ok "the planted copy really fails to compile" '! python3 -m py_compile $S/pg-syntax.py'
+hc $S/pg-syntax.py $W "$G origin HEAD:x" 2 "SyntaxError in the guard: a worker's push → deny (exit 2, not 1)"
+hc $S/pg-syntax.py $R "ls" 2 "…and every other command too (the guard is off: refuse until it loads)"
+ok "…saying why" 'grep -q "push-guard failed to run (exit 1)" <<< "$out"'
+printf 'import sys\nsys.exit(1)\n' > $S/pg-exit1.py
+hc $S/pg-exit1.py $R "$G -f origin main" 2 "a guard that exits 1 → deny"
+hc none $R "ls" 2 "the guard file missing → deny"
+hc $H $R "ls" 2 "no python3 on PATH → deny" /bin/sh $S/nopy
+# no shell syntax at the top level: a non-POSIX shell (fish) only splits words — argvsh does just that, then execs
+printf '#!/usr/bin/env python3\nimport os, shlex, sys\na = shlex.split(sys.argv[2])\nos.execvp(a[0], a)\n' > $S/argvsh; chmod +x $S/argvsh
+for SH in /bin/sh $(command -v bash) $(command -v zsh) $(command -v fish) $S/argvsh; do
+  hc $S/pg-syntax.py $W "$G origin HEAD:x" 2 "a broken guard via the hook command ($SH) → deny" $SH
+  hc $H $R "ls" 0 "real guard via the hook command ($SH): ls → no decision, no output" $SH
+  hc $H $R "$G origin main" 0 "  …a normal push from the main checkout → no decision" $SH
+  hc $H $R "$G --force origin main" 2 "  …a force push → deny" $SH
+  ok "  …with the guard's own message only" '[ "$out" = "$(call $R "$G --force origin main")" ] && ! grep -q "failed to run" <<< "$out"'
+  hc $H $W "$G origin HEAD:x" 2 "  …a worker's push → deny" $SH
+  hc $H $W "cmux send --surface surface:70 hi" 2 "  …a worker's cmux send → deny" $SH
+done
+
 echo "PASSED $P FAILED $F"; [ $F = 0 ]

@@ -225,13 +225,32 @@ ok "…nor ship" '[ $rc != 0 ] && grep -q "workers never merge or ship" <<< "$ou
 $O merge --run $RUN4 --slice U --sha $HU >/dev/null 2>&1
 ok "merge from the manager → pushed" '[ "$(remote $BR4)" = "$HU" ]'
 
-echo "-- bare-list plan: a task's own risky flag counts; a slice not in the plan needs the OK too"
+echo "-- bare-list plan: a task's own risky flag counts"
 git -C $R worktree add -q $R/.claude/worktrees/$RUN4-V -b worktree-$RUN4-V origin/$BR4; HV=$(commit $R/.claude/worktrees/$RUN4-V v v.txt); printf 'sha: %s\n' $HV > $D4/slices/V.ready.md
 out=$($O merge --run $RUN4 --slice V --sha $HV 2>&1); rc=$?
 ok "bare list with risky:true → 3" '[ $rc = 3 ] && [ "$(remote $BR4)" = "$HU" ]'
+
+echo "-- a slice not in plan.json (or no plan.json): 3, the manager fixes the plan — no NEEDS YOU item, no notification"
 git -C $R worktree add -q $R/.claude/worktrees/$RUN4-W -b worktree-$RUN4-W origin/$BR4; HW=$(commit $R/.claude/worktrees/$RUN4-W w w.txt); printf 'sha: %s\n' $HW > $D4/slices/W.ready.md
+n0=$(notifies); w0=$(cksum < $D4/waiting.json)
 out=$($O merge --run $RUN4 --slice W --sha $HW 2>&1); rc=$?
-ok "slice not in plan.json → 3" '[ $rc = 3 ] && grep -q "not in plan.json" $D4/waiting.json && [ "$(remote $BR4)" = "$HU" ]'
+ok "slice not in plan.json → 3, told to add it to plan.json" '[ $rc = 3 ] && grep -q "add W to plan.json" <<< "$out" && [ "$(remote $BR4)" = "$HU" ]'
+ok "  …no NEEDS YOU item, no notification" '[ "$(cksum < $D4/waiting.json)" = "$w0" ] && [ "$(notifies)" = "$n0" ]'
+out=$($O merge --run $RUN4 --slice W --sha $HW --user-ok 2>&1); rc=$?
+ok "  …--user-ok doesn't get past it either" '[ $rc = 3 ] && [ "$(remote $BR4)" = "$HU" ] && [ "$(cksum < $D4/waiting.json)" = "$w0" ]'
+mv $D4/plan.json $S/plan4.keep
+out=$($O merge --run $RUN4 --slice W --sha $HW 2>&1); rc=$?
+ok "no plan.json → 3, no item, no notification" '[ $rc = 3 ] && grep -q "add W to plan.json" <<< "$out" && [ "$(remote $BR4)" = "$HU" ] && [ "$(cksum < $D4/waiting.json)" = "$w0" ] && [ "$(notifies)" = "$n0" ]'
+mv $S/plan4.keep $D4/plan.json
+
+echo "-- an open item for another reason never counts as the user's OK (W added to plan.json as risky afterwards)"
+$O note --run $RUN4 --wait "OK to merge W at $HW into $BR4? (not in plan.json; evidence $D4/slices/W.ready.md)" >/dev/null
+NS=$(J $D4/waiting.json "[x[\"n\"] for x in d if \"not in plan.json\" in x[\"text\"]][0]")
+echo '[{"id":"U","title":"u","wave":1,"depends":[]},{"id":"V","title":"auth","wave":1,"depends":[],"risky":true},{"id":"W","title":"w","wave":1,"depends":[],"risky":true}]' > $S/plan4.json; $O note --run $RUN4 --plan $S/plan4.json >/dev/null
+out=$($O merge --run $RUN4 --slice W --sha $HW --user-ok 2>&1); rc=$?
+ok "a 'not in plan.json' item for W at this sha + --user-ok → 3, not merged" '[ $rc = 3 ] && grep -q "wasn.t asked" <<< "$out" && [ "$(remote $BR4)" = "$HU" ] && [ ! -f $D4/workers/W.json ]'
+ok "  …a risky-task item for W opens (the user is asked now)" 'grep -q "OK to merge W w at $HW into $BR4? (risky task;" $D4/waiting.json'
+$O note --run $RUN4 --done $NS >/dev/null
 
 echo "-- NEEDS YOU numbers stay fixed when an earlier item is cleared"
 NV=$(J $D4/waiting.json "[x[\"n\"] for x in d if \" V \" in x[\"text\"]][0]"); NW=$(J $D4/waiting.json "[x[\"n\"] for x in d if \" W \" in x[\"text\"]][0]")
@@ -244,6 +263,21 @@ out=$($O merge --run $RUN4 --slice W --sha $HW 2>/dev/null)
 ok "merge exit 3 again prints W's same number" '[ "$(echo "$out" | head -1)" = "$NW" ]'
 $O note --run $RUN4 --done $NW >/dev/null
 ok "W's saved number clears W, not the newer item" '! grep -q " W " $D4/waiting.json && grep -q "Another question" $D4/waiting.json'
+$O note --run $RUN4 --done all >/dev/null
+
+echo "-- only the question merge itself asked counts: not a hand-written look-alike, not one asked for another reason"
+EV4=$(python3 -c "import os,sys; print(os.path.normpath(sys.argv[1]))" $D4/slices/V.ready.md)   # the path as merge writes it (TMPDIR may end in /)
+$O note --run $RUN4 --wait "OK to merge V auth at $HV into $BR4? (risky task; evidence $EV4)" >/dev/null
+n0=$(notifies); out=$($O merge --run $RUN4 --slice V --sha $HV --user-ok 2>&1); rc=$?
+ok "a note --wait with merge's exact wording + --user-ok → 3, not merged" '[ $rc = 3 ] && grep -q "wasn.t asked" <<< "$out" && [ "$(remote $BR4)" = "$HU" ] && [ ! -f $D4/workers/V.json ]'
+ok "  …merge takes that item as its own question (one item, no second notification)" '[ "$(J $D4/waiting.json "len(d)")" = 1 ] && [ "$(notifies)" = "$n0" ]'
+$O note --run $RUN4 --done all >/dev/null
+echo '{"merge_policy":"manual","tasks":[{"id":"U","title":"u","wave":1,"depends":[]},{"id":"W","title":"w","wave":1,"depends":[]}]}' > $S/plan4m.json; $O note --run $RUN4 --plan $S/plan4m.json >/dev/null
+out=$($O merge --run $RUN4 --slice W --sha $HW 2>&1); rc=$?
+ok "manual policy: W → 3, asked as 'merge policy manual'" '[ $rc = 3 ] && grep -q "(merge policy manual;" $D4/waiting.json'
+$O note --run $RUN4 --plan $S/plan4.json >/dev/null   # W risky again
+out=$($O merge --run $RUN4 --slice W --sha $HW --user-ok 2>&1); rc=$?
+ok "W made risky after that question: --user-ok → 3, not merged, asked again as a risky task" '[ $rc = 3 ] && [ "$(remote $BR4)" = "$HU" ] && [ ! -f $D4/workers/W.json ] && grep -q "OK to merge W w at $HW into $BR4? (risky task;" $D4/waiting.json'
 $O note --run $RUN4 --done all >/dev/null
 
 echo "-- unreadable plan.json: merge refuses, nothing changed"

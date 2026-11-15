@@ -1196,7 +1196,8 @@ def cmd_reap(a):
 def cmd_end_run(a):
     p = RUNS / a.run / "run.json"
     r = read_json(p) or sys.exit(f"orch: no run {a.run}")
-    # tear everything down: every worker (whatever its state), the integration worktree, its processes
+    # tear everything down: every worker (whatever its state), the feature worktree (and an older run's integration
+    # worktree), their processes
     total, names = 0.0, owner_names()
     for w, wk in workers_of(RUNS / a.run, status=None):
         did, mb = cleanup_worker(r, wk, full=True, names=names)
@@ -1371,13 +1372,17 @@ def state_flock(name, secs=None, busy=""):
         yield
 
 
-def add_need(d, text):
+def add_need(d, text, ok=None):
     """Add an item to NEEDS YOU (deduplicated by text), numbered from a per-run counter that never reuses a number.
+    ok: merge exit 3's record of the question it asked (on the item, new or not) — what --user-ok matches.
     Returns (needs, the item's number, whether it is new); the read-modify-write is serialised per run."""
     with state_flock(f"needs-{d.name}.flock"):
         needs = read_json(d / "waiting.json", [])
         item = next((x for x in needs if x["text"] == text), None)
         new = item is None
+        if not new and ok and item.get("ok") != ok:
+            item["ok"] = ok
+            write_json(d / "waiting.json", needs)
         if new:
             seq, last = HOME / "state" / f"needs-{d.name}.seq", 0
             for f in (seq, d / "waiting.seq"):  # the run dir's: runs started before the counter moved
@@ -1387,7 +1392,7 @@ def add_need(d, text):
                     pass
             n = max([last, len(needs)] + [x["n"] for x in needs if isinstance(x.get("n"), int)]) + 1
             seq.write_text(str(n))
-            item = {"n": n, "text": text, "since": time.strftime("%H:%M")}
+            item = {"n": n, "text": text, "since": time.strftime("%H:%M"), **({"ok": ok} if ok else {})}
             needs.append(item)
             write_json(d / "waiting.json", needs)
         return needs, need_no(item, needs.index(item) + 1), new
@@ -1401,11 +1406,11 @@ def drop_needs(d, keep):
         return needs
 
 
-def need_you(d, text):
+def need_you(d, text, ok=None):
     """Add a NEEDS YOU item and, only when it is new, notify the user once (`cmux notify`). The single place orch
     notifies from (note --wait, merge exit 3). A failed or missing cmux never fails the caller.
     Returns (needs, the item's number)."""
-    needs, n, new = add_need(d, text)
+    needs, n, new = add_need(d, text, ok)
     if new:
         title = (read_json(d / "run.json") or {}).get("title") or d.name
         cmux("notify", "--title", "Orchestra: needs you", "--subtitle", title, "--body", text)
@@ -1842,16 +1847,24 @@ def worker_head(r, sl):
     return git(r["repo"], "rev-parse", "-q", "--verify", f"refs/heads/worktree-{name}^{{commit}}", check=False)
 
 
-def ok_item(sl, head):
-    """The NEEDS YOU item merge exit 3 opens for this task at this sha (what --user-ok must match)."""
-    return lambda w: w["text"].startswith(f"OK to merge {sl} ") and f" at {head} into " in w["text"]
+def ok_record(sl, head, br, why):
+    return {"slice": sl, "sha": head, "branch": br, "why": why}
+
+
+def ok_item(sl, head, br, why):
+    """The NEEDS YOU item merge exit 3 opened for this task at this sha into this branch for this reason: what
+    --user-ok must match. Matched by the record only merge writes (add_need's ok), never by the text, so a hand-written
+    note (note --wait) or an item for another reason, task, sha or branch never counts as the user's OK."""
+    want = ok_record(sl, head, br, why)
+    return lambda w: isinstance(w, dict) and w.get("ok") == want
 
 
 @on_feature
 def cmd_merge(a):
     """Fast-forward orch/<run> to a READY task's head and push it. Exit 0 merged; 2 not a fast-forward (REBASE);
-    3 needs the user's OK (risky task, merge_policy manual, or a task not in plan.json; no --user-ok, or no open NEEDS
-    YOU item for this sha: adds it + notifies); 4 evidence missing/stale or the sha doesn't match.
+    3 needs the user's OK (risky task or merge_policy manual; no --user-ok, or no open NEEDS YOU item for this sha:
+    adds it + notifies), or the task isn't in plan.json / there is no plan.json (the manager's fix: no item, no
+    notification); 4 evidence missing/stale or the sha doesn't match.
     Any non-zero exit: nothing changed."""
     sl, want = a.slice, a.sha.lower()
     d, r, br, feat = feature_of(a)
@@ -1883,13 +1896,15 @@ def cmd_merge(a):
         fail(1, f"{d / 'plan.json'} is unreadable or malformed — fix it with orch note --plan; nothing done")
     policy, tasks = plan_of(d)
     task = next((t for t in tasks if t.get("id") == sl), None)
-    why = ("not in plan.json" if task is None else "risky task" if task.get("risky")
-           else None if policy == "auto" else f"merge policy {policy}")
-    task = task or {}
-    asked = any(map(ok_item(sl, head), read_json(d / "waiting.json", [])))
+    if task is None:  # the plan is wrong, not a question for the user: no NEEDS YOU item, no notification
+        fail(3, f"{sl} isn't in {d / 'plan.json'}: add {sl} to plan.json (orch note --run {a.run} --plan <file>), "
+                f"then merge again — nothing done")
+    why = "risky task" if task.get("risky") else None if policy == "auto" else f"merge policy {policy}"
+    asked = any(map(ok_item(sl, head, br, why), read_json(d / "waiting.json", [])))
     if why and not (a.user_ok and asked):  # an OK counts only for the sha the user was shown (its open item)
         title = f" {task['title']}" if task.get("title") else ""
-        _, n = need_you(d, f"OK to merge {sl}{title} at {head} into {br}? ({why}; evidence {ev})")
+        _, n = need_you(d, f"OK to merge {sl}{title} at {head} into {br}? ({why}; evidence {ev})",
+                        ok_record(sl, head, br, why))
         print(n)
         fail(3, (f"--user-ok, but the user wasn't asked about {head[:12]} (the sha changed?): " if a.user_ok else "")
              + f"{sl} needs the user's OK ({why}): NEEDS YOU item {n}; once OK'd: "

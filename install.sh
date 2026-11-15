@@ -70,8 +70,9 @@ row NAME KIND STATUS
 if has "$CMUX"; then row cmux required found; else row cmux required "missing — brew install --cask cmux"; MISSING+=(cmux); fi
 PYBAD=""
 if has python3 && PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3, 9))' 2>/dev/null); then
-  # smoke test: each hook (push-guard.py) must load with this interpreter: one that can't would fail closed on every
-  # command naming push, cmux or broadcast in every repo (or, for a hook without that guard, be silently off)
+  # smoke test: each hook (push-guard.py) must load with this interpreter: with one that can't, the hook command
+  # refuses every Bash command in every repo (push-guard failed to run), or the guard denies every command naming
+  # push, cmux or broadcast
   for hook in "$SRC"/orchestra/hooks/*.py; do
     [ -f "$hook" ] || continue
     if ! err=$(python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location("hook", sys.argv[1]); s.loader.exec_module(u.module_from_spec(s))' \
@@ -107,7 +108,7 @@ EOF
 fi
 if [ -n "$PYBAD" ]; then
   echo "install.sh: $PYBAD" >&2
-  echo "install.sh: with it, the guard would deny every command naming push, cmux or broadcast, or (if it can't compile) be silently off. Use a python3 it loads with (brew install python) first on PATH, and rerun. Nothing was written." >&2
+  echo "install.sh: with it, the guard would deny every command naming push, cmux or broadcast, or (if it can't compile) the hook would refuse every Bash command. Use a python3 it loads with (brew install python) first on PATH, and rerun. Nothing was written." >&2
   exit 1
 fi
 # ---------- 2. questions (before anything is written) ----------

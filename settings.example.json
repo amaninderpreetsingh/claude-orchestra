@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/orchestra/hooks/push-guard.py\"",
+            "command": "/bin/sh -c 'python3 \"$HOME/.claude/orchestra/hooks/push-guard.py\" || { r=$?; [ $r = 2 ] || echo \"push-guard failed to run (exit $r); refused\" >&2; exit 2; }'",
             "timeout": 60
           }
         ]

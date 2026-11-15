@@ -78,7 +78,8 @@ ok "CLAUDE.md keeps the user's text first" '[ "$(head -2 "$C/CLAUDE.md")" = "$(c
 ok "CLAUDE.md has one marked block" '[ "$(grep -c "^<!-- claude-orchestra:start -->$" "$C/CLAUDE.md")" = 1 ] && [ "$(grep -c "^<!-- claude-orchestra:end -->$" "$C/CLAUDE.md")" = 1 ]'
 ok "block holds the template" 'grep -qF "$(sed -n 3p "$ROOT/CLAUDE.template.md")" "$C/CLAUDE.md"'
 ok "user settings kept" '[ "$(J "\"|\".join([d[\"model\"]] + d[\"permissions\"][\"allow\"] + [d[\"hooks\"][\"PostToolUse\"][0][\"hooks\"][0][\"command\"]])")" = "my-model|Bash(ls *)|echo mine" ]'
-ok "push-guard hook merged, HOME-relative" '[ "$(J "\"|\".join(h[\"command\"] for e in d[\"hooks\"][\"PreToolUse\"] if e[\"matcher\"]==\"Bash\" for h in e[\"hooks\"])")" = "python3 \"\$HOME/.claude/orchestra/hooks/push-guard.py\"" ]'
+GUARDCMD=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([h["command"] for e in d["hooks"]["PreToolUse"] if e["matcher"]=="Bash" for h in e["hooks"] if "push-guard.py" in h["command"]][0])' "$ROOT/settings.example.json")
+ok "push-guard hook merged, HOME-relative, exactly settings.example.json's command" 'grep -qF "\"\$HOME/.claude/orchestra/hooks/push-guard.py\"" <<< "$GUARDCMD" && [ "$(J "\"|\".join(h[\"command\"] for e in d[\"hooks\"][\"PreToolUse\"] if e[\"matcher\"]==\"Bash\" for h in e[\"hooks\"])")" = "$GUARDCMD" ]'
 ok "statusline merged" 'J "d[\"statusLine\"][\"command\"]" | grep -qF "\$HOME/.claude/statusline/statusline.py"'
 ok "deny rules merged without duplicates" '[ "$(J "d[\"permissions\"][\"deny\"].count(\"Bash(git push -f *)\"), \"Bash(git push --force *)\" in d[\"permissions\"][\"deny\"], \"Bash(rm -rf /)\" in d[\"permissions\"][\"deny\"]")" = "(1, True, True)" ]'
 ok "no settings key outside hooks/statusLine/permissions added" '[ "$(J "\" \".join(sorted(d))")" = "hooks model permissions statusLine" ]'
