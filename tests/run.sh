@@ -7,8 +7,8 @@
 # Each suite's output is buffered and the table is printed in suite order once all have finished.
 # Each suite gets its own temp HOME and ORCH_HOME, a throwaway git identity, no inherited
 # CMUX_*/ORCH_*/CLAUDE*/GIT_* variables, and stubs FIRST on PATH: `cmux` (a test must never reach the
-# real one — it would open real workspaces) plus `caffeinate`, `xcrun`, `osascript` (no real
-# sleep blockers, simulators or UI scripting). A suite may still put its own stubs before these.
+# real one — it would open real workspaces) plus `caffeinate`, `osascript` (no real
+# sleep blockers or UI scripting). A suite may still put its own stubs before these.
 # It also gets ORCH_TEST_PORT_BASE: the first port of a 100-port block no other suite or run.sh copy holds.
 # ORCH_PYTHON=<interpreter> (e.g. /usr/bin/python3, macOS's 3.9) runs every suite with that interpreter as `python3`:
 # a shim first on PATH, so `python3 …`, `#!/usr/bin/env python3` scripts and hooks all resolve to it.
@@ -17,13 +17,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Timing-sensitive suites: they assert on wall-clock windows, so they run alone after the parallel
 # batch instead of sharing the CPU with it (their tolerances stay as they are):
-#   test-guard-bypass.sh  guard deadlines: a deny must land within ORCH_GUARD_DEADLINE (el ≤ 6s / ≤ 10s)
 #   test-watch.sh         orch-watch --timeout/--interval: elapsed time must fall in [2,6]s / ≤ 6s
-#   test-sim.sh           orch-sim lock waits: "waited ≥ 1s" behind a 1.5s holder, "< 5s" past a killed one
 #   test-orch-reap-timing.sh  close/reap read the argv/cwd of helpers given a 0.3s head start, and wait on
 #                         listeners with 6s up/down polls (test-orch-reap.sh keeps the non-timing checks)
 # Only suites that were found or named are matched against this list, so a name here without a file is harmless.
-SOLO=" test-guard-bypass.sh test-watch.sh test-sim.sh test-orch-reap-timing.sh "
+SOLO=" test-watch.sh test-orch-reap-timing.sh "
 JOBS=${ORCH_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 case "$JOBS" in ''|*[!0-9]*|0) echo "run.sh: ORCH_TEST_JOBS must be a positive integer (got '$JOBS')"; exit 1 ;; esac
 if [ $# -gt 0 ]; then
@@ -90,9 +88,9 @@ start(){ # start <index>: run that suite in the background in its own box; its e
   local suite=${SUITES[$1]} box; box=$(box_of "$1"); mkdir -p "$box/home" "$box/orch" "$box/bin"
   # Stub cmux: records its args, prints nothing, exits 1 — the same as "cmux not running".
   printf '#!/bin/sh\necho "$*" >> "%s/cmux-calls.log"\nexit 1\n' "$box" > "$box/bin/cmux"
-  # Stub caffeinate/xcrun/osascript: record their args and exit 0 at once (a real `caffeinate -is`
+  # Stub caffeinate/osascript: record their args and exit 0 at once (a real `caffeinate -is`
   # started by `orch new-run` would outlive the suite and keep the machine awake).
-  for x in caffeinate xcrun osascript; do
+  for x in caffeinate osascript; do
     printf '#!/bin/sh\necho "$*" >> "%s/%s-calls.log"\nexit 0\n' "$box" "$x" > "$box/bin/$x"; done
   chmod +x "$box/bin/"*
   printf '[user]\n\tname = orchestra-test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n' > "$box/home/.gitconfig"

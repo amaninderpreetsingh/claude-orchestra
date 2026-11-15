@@ -18,8 +18,8 @@ up(){ for i in $(seq 1 30); do nc -z 127.0.0.1 $1 2>/dev/null && return 0; sleep
 down(){ for i in $(seq 1 30); do nc -z 127.0.0.1 $1 2>/dev/null || return 0; sleep 0.2; done; return 1; }
 serve(){ # serve <dir> <port> → $SP: a plain http.server running in <dir>
   (cd "$1" && exec python3 -m http.server $2 --bind 127.0.0.1 >/dev/null 2>&1) & SP=$!; PIDS+=($SP); up $2; }
-reap(){ $O reap --keep-sim >/dev/null 2>&1; }
-reapout(){ $O reap --keep-sim --dry-run 2>&1; }
+reap(){ $O reap >/dev/null 2>&1; }
+reapout(){ $O reap --dry-run 2>&1; }
 alive(){ kill -0 $1 2>/dev/null; }
 
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo
@@ -55,7 +55,7 @@ kill $(lsof -ti tcp:$((PA + 3)) 2>/dev/null) $B1 $B2 $B3 $B4 $B5 2>/dev/null; wa
 echo "-- blocks held before port history existed get a record"
 HB=$((B + 70)); mkdir -p $ORCH_HOME/locks/ports/$HB; echo '{"owner":"'$R'-old"}' > $ORCH_HOME/locks/ports/$HB/owner.json
 serve $S/elsewhere $NEVER; H1=$SP
-$O reap --dry-run --keep-sim >/dev/null 2>&1
+$O reap --dry-run >/dev/null 2>&1
 ok "reap --dry-run writes no port history" '[ ! -e $ORCH_HOME/state/port-history/$HB.json ]'
 reap
 ok "reap records a held block's owner (so a later orphan on it can be tied)" 'grep -q "\"$R-old\"" $ORCH_HOME/state/port-history/$HB.json'
@@ -113,26 +113,22 @@ mk(){ echo '{"run":"'$R'","slice":"'$1'","name":"'$R-$1'","status":"merged","mer
   if [ "${4:-}" = plain ]; then mkdir -p $WT/$R-$1; else git -C $REPO worktree add -q --detach $WT/$R-$1; fi
   hold $WT/$R-$1/node_modules/.bin/vite; }
 mk M1 30; M1P=$HP                                # merged 30 s ago: still between `orch merged` and its report
-mk M2 900; M2P=$HP                               # merged 15 min ago, lock released: cleaned
-mk M3 900; M3P=$HP; $O merge-lock --repo $S/repo --owner $R-M3 --wait 0 >/dev/null 2>&1   # 15 min ago, still holds the lock
+mk M2 900; M2P=$HP                               # merged 15 min ago (past the grace period): cleaned
 mk M4 900 ',"cleaned":"'"$(ago 600)"'"'; M4P=$HP   # already cleaned once
 mk M5 900 "" plain; M5P=$HP                      # its worktree can't be removed (not a git worktree): cleanup fails
 sleep 0.3
 reap
 ok "a worker merged seconds ago keeps its processes (it hasn't reported yet)" 'alive $M1P'
 ok "…and isn't marked cleaned" '! grep -q cleaned $D/workers/M1.json'
-ok "a worker merged 15 min ago that released the merge lock is cleaned" '! alive $M2P && grep -q cleaned $D/workers/M2.json'
-ok "a merged worker still holding the merge lock keeps its processes" 'alive $M3P && ! grep -q cleaned $D/workers/M3.json'
+ok "a worker merged 15 min ago is cleaned" '! alive $M2P && grep -q cleaned $D/workers/M2.json'
 ok "a worker already marked cleaned is skipped" 'alive $M4P'
 ok "a cleanup that left the worktree behind isn't marked cleaned" '[ -d $WT/$R-M5 ] && ! grep -q cleaned $D/workers/M5.json'
-$O merge-unlock --repo $S/repo --owner $R-M3 >/dev/null 2>&1
 reap
 ok "…so the next reap retries it" '! grep -q cleaned $D/workers/M5.json && grep -q "$R-M5" <<< "$(reapout)"'
-ok "once it released the lock, it is cleaned" '! alive $M3P && grep -q cleaned $D/workers/M3.json'
 c1=$(grep -o '"cleaned": *"[^"]*"' $D/workers/M2.json)
 reap
 ok "a cleaned worker isn't cleaned again (its cleaned time is unchanged)" '[ "$(grep -o "\"cleaned\": *\"[^\"]*\"" $D/workers/M2.json)" = "$c1" ]'
-kill $M1P $M2P $M3P $M4P $M5P 2>/dev/null; wait $M1P $M2P $M3P $M4P $M5P 2>/dev/null
+kill $M1P $M2P $M4P $M5P 2>/dev/null; wait $M1P $M2P $M4P $M5P 2>/dev/null
 rm -f $D/workers/M?.json
 
 echo "-- orch close whose cleanup didn't finish isn't marked cleaned, so reap retries it"
@@ -153,8 +149,8 @@ echo "-- no active run (only the orphan rule applies: no finished worker is clea
 read EA EB < <($O ports --run $R --name job3)
 R2=$($O new-run --repo $S/repo --title other$$ --coordinator workspace:0)
 read QA QB < <($O ports --run $R2 --name job2)
-$O end-run --run $R2 --status aborted --keep-sim >/dev/null 2>&1
-$O end-run --run $R --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $R2 --status aborted >/dev/null 2>&1
+$O end-run --run $R --status aborted >/dev/null 2>&1
 LA=$((B + 60)); mkdir -p $ORCH_HOME/locks/ports/$LA; echo '{"owner":"ops-console"}' > $ORCH_HOME/locks/ports/$LA/owner.json
 mkdir -p $WT/$R-S1 $WT/$R-integrate
 ok "(the never-allocated block really never was)" '[ ! -e $ORCH_HOME/state/port-history/$((NEVER / 10 * 10)).json ]'

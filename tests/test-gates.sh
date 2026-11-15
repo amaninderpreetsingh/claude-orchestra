@@ -156,7 +156,7 @@ cat > "$S/suites/env.sh" <<EOF
 [ "\$(dirname "\$(command -v cmux)")" = "\$(dirname "\$HOME")/bin" ] && echo "ok   stub cmux first on PATH" || echo "FAIL real cmux reachable"
 cmux new-workspace --name x >/dev/null 2>&1 && echo "FAIL stub cmux succeeded" || echo "ok   stub cmux exits non-zero"
 [ "\$(git config user.email)" = test@example.invalid ] && echo "ok   throwaway git identity" || echo "FAIL git identity"
-for x in caffeinate xcrun osascript; do
+for x in caffeinate osascript; do
   [ "\$(command -v \$x)" = "\$(dirname "\$HOME")/bin/\$x" ] && \$x -is >/dev/null 2>&1 && echo "ok   stub \$x" || echo "FAIL real \$x reachable"; done
 [ -z "\$(env | grep -E '^(CMUX|ORCH_PORT|CLAUDE)')" ] && echo "ok   CMUX/ORCH/CLAUDE env scrubbed" || echo "FAIL inherited env"
 [ -z "\${GIT_DIR:-}\${GIT_CONFIG_GLOBAL:-}" ] && echo "ok   GIT_* env scrubbed" || echo "FAIL inherited GIT_*"
@@ -170,7 +170,7 @@ ok "failing assertion is shown" 'grep -q "    FAIL b" <<< "$out"'
 RS "$S/suites/crash.sh"
 ok "non-zero exit without FAIL lines still fails" '[ $rc = 1 ] && grep -q "FAILED (exit 3)" <<< "$out"'
 out=$(CMUX_SOCKET_PATH=/x/sock ORCH_PORT=1 CLAUDE_FAKE=1 GIT_DIR=/x/.git GIT_CONFIG_GLOBAL=/x/cfg bash "$ROOT/tests/run.sh" "$S/suites/env.sh" 2>&1); rc=$?
-ok "suite runs isolated: stubs first, own HOME/ORCH_HOME, env scrubbed" '[ $rc = 0 ] && grep -qE "^env.sh +10 +0  ok" <<< "$out"'
+ok "suite runs isolated: stubs first, own HOME/ORCH_HOME, env scrubbed" '[ $rc = 0 ] && grep -qE "^env.sh +9 +0  ok" <<< "$out"'
 RS "$S/suites/silent.sh"
 ok "suite with no ok lines fails" '[ $rc = 1 ] && grep -q "FAILED (no ok lines)" <<< "$out"'
 # ORCH_PYTHON: a fake interpreter (logs each call, then runs the real one) must serve python3 calls and shebangs
@@ -218,12 +218,12 @@ ok "ORCH_TEST_JOBS=1 runs them one at a time" '[ $rc = 0 ] && [ "$(maxlive)" = 1
 for j in 0 x -2; do out=$(ORCH_TEST_JOBS=$j bash "$ROOT/tests/run.sh" "$S/suites/pass.sh" 2>&1); rc=$?
   ok "ORCH_TEST_JOBS=$j is refused" '[ $rc = 1 ] && grep -q "ORCH_TEST_JOBS must be a positive integer" <<< "$out"'; done
 # timing-sensitive suites (by name) run after the rest, alone; parallel ones sorting after them prove the reorder
-meet test-watch 1 > "$S/solo/test-watch.sh"; meet test-sim 1 > "$S/solo/test-sim.sh"; meet z1 2 > "$S/solo/z1.sh"; meet z2 2 > "$S/solo/z2.sh"
+meet test-watch 1 > "$S/solo/test-watch.sh"; meet test-orch-reap-timing 1 > "$S/solo/test-orch-reap-timing.sh"; meet z1 2 > "$S/solo/z1.sh"; meet z2 2 > "$S/solo/z2.sh"
 fresh; out=$(ORCH_TEST_JOBS=4 SUITES_DIR="$S/solo" EXTRA_SUITES_DIR="$S/empty" bash "$ROOT/tests/run.sh" 2>&1); rc=$?
 ok "the parallel ones ran together (z1 and z2 met)" '[ $rc = 0 ] && grep -qE "^z1.sh +1 +0  ok" <<< "$out" && grep -qE "^z2.sh +1 +0  ok" <<< "$out"'
 ok "timing-sensitive suites start only after the parallel ones ended" '[ "$(grep -n "start test-" "$S/span.log" | head -1 | cut -d: -f1)" -gt "$(grep -n "end z" "$S/span.log" | tail -1 | cut -d: -f1)" ]'
-ok "...one at a time, alone" '[ "$(grep -cE "^start test-(sim|watch) 1$" "$S/span.log")" = 2 ]'
-ok "the table keeps suite order, not finishing order" '[ "$(grep -oE "^(test-sim|test-watch|z1|z2)\.sh" <<< "$out" | tr "\n" " ")" = "test-sim.sh test-watch.sh z1.sh z2.sh " ]'
+ok "...one at a time, alone" '[ "$(grep -cE "^start test-(orch-reap-timing|watch) 1$" "$S/span.log")" = 2 ]'
+ok "the table keeps suite order, not finishing order" '[ "$(grep -oE "^(test-orch-reap-timing|test-watch|z1|z2)\.sh" <<< "$out" | tr "\n" " ")" = "test-orch-reap-timing.sh test-watch.sh z1.sh z2.sh " ]'
 # failing suites printing at the same moments: each one's lines stay together under its own row
 mkdir -p "$S/mix"; for n in m1 m2; do printf '#!/usr/bin/env bash\nfor i in 1 2 3 4; do echo "FAIL %s-$i"; sleep 0.1; done; exit 1\n' $n > "$S/mix/$n.sh"; done
 out=$(ORCH_TEST_JOBS=2 bash "$ROOT/tests/run.sh" "$S/mix/m1.sh" "$S/mix/m2.sh" "$S/suites/pass.sh" 2>&1); rc=$?

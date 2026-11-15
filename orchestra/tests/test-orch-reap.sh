@@ -11,8 +11,8 @@ mkdir -p $S/stub; for x in caffeinate xcrun osascript; do printf '#!/bin/sh\nexi
 printf '#!/bin/sh\nexit 1\n' > $S/stub/cmux; chmod +x $S/stub/*; export PATH=$S/stub:$PATH  # never the real ones
 P=0; F=0
 ok(){ if eval "$2"; then P=$((P+1)); echo "ok   $1"; else F=$((F+1)); echo "FAIL $1"; fi; }
-reap(){ $O reap --keep-sim >/dev/null 2>&1; }
-reapout(){ $O reap --keep-sim --dry-run 2>&1; }
+reap(){ $O reap >/dev/null 2>&1; }
+reapout(){ $O reap --dry-run 2>&1; }
 
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo
 echo a > a.txt; git add .; git commit -qm init; git push -q origin main; git remote set-head origin main; cd $S
@@ -45,14 +45,14 @@ echo '{"run":"'$R3'","slice":"E1","name":"'$R3-E1'","status":"active"}' > $D3/wo
 echo '{"run":"'$R3'","slice":"E2","name":"'$R3-E2'","status":"active"}' > $D3/workers/E2.json
 echo '{"run":"'$R3'","slice":"E3","name":"'$R3-E3'","status":"dead"}' > $D3/workers/E3.json
 mkdir -p $WT/$R3-E1 $WT/$R3-E3; git -C $REPO worktree add -q --detach $WT/$R3-E2
-eout=$($O end-run --run $R3 --status aborted --keep-sim 2>&1)
+eout=$($O end-run --run $R3 --status aborted 2>&1)
 ok "end-run with a worktree it couldn't remove doesn't mark that worker cleaned" '[ -d $WT/$R3-E1 ] && ! grep -q cleaned $D3/workers/E1.json'
 ok "...and says so, naming the retry" 'grep "NOT finished $R3-E1" <<< "$eout" | grep -q "orch reap --run $R3"'
 ok "end-run makes a dead worker finished too (so a retry cleans it in full)" 'grep -q "\"status\": *\"aborted\"" $D3/workers/E3.json'
 rm -rf $WT/$R3-E3; git -C $REPO worktree add -q --detach $WT/$R3-E3
 ok "end-run marks a worker it fully cleaned as cleaned" '[ ! -d $WT/$R3-E2 ] && grep -q cleaned $D3/workers/E2.json'
-ok "...and reap --run retries the unfinished one" 'grep -q "$R3-E1" <<< "$($O reap --run $R3 --keep-sim --dry-run 2>&1)"'
-rm -rf $WT/$R3-E1; git -C $REPO worktree add -q --detach $WT/$R3-E1; $O reap --run $R3 --keep-sim >/dev/null 2>&1
+ok "...and reap --run retries the unfinished one" 'grep -q "$R3-E1" <<< "$($O reap --run $R3 --dry-run 2>&1)"'
+rm -rf $WT/$R3-E1; git -C $REPO worktree add -q --detach $WT/$R3-E1; $O reap --run $R3 >/dev/null 2>&1
 ok "...then marks it cleaned" '[ ! -d $WT/$R3-E1 ] && grep -q cleaned $D3/workers/E1.json'
 ok "...and the formerly dead one is removed in full and cleaned" '[ ! -d $WT/$R3-E3 ] && grep -q cleaned $D3/workers/E3.json'
 

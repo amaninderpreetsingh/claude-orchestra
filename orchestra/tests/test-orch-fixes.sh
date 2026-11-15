@@ -61,7 +61,7 @@ ok "run.json id matches the suffixed dir" '[ "$(jget $ORCH_HOME/runs/$out/run.js
 for m in $M0 $M1; do mkdir -p $ORCH_HOME/runs/$m-tri $ORCH_HOME/runs/$m-tri-2; done
 run $O new-run --repo $R --title tri --coordinator workspace:0
 ok "base and -2 taken → -3" '[ $rc = 0 ] && [[ "$out" =~ ^[0-9]{4}-[0-9]{4}-tri-3$ ]]'
-for d in $ORCH_HOME/runs/*; do [ -f $d/run.json ] && $O end-run --run $(basename $d) --status aborted --keep-sim >/dev/null 2>&1; done
+for d in $ORCH_HOME/runs/*; do [ -f $d/run.json ] && $O end-run --run $(basename $d) --status aborted >/dev/null 2>&1; done
 
 echo "-- M5: ORCH_CMUX + spawn --dry-run"
 home m5; RUN=$($O new-run --repo $R --title m5 --coordinator surface:30 --coordinator-workspace workspace:3); D=$ORCH_HOME/runs/$RUN
@@ -91,16 +91,16 @@ echo "-- M3: end-run dissolves the run's cmux group"
 ok "spawn stored the group in run.json" '[ "$(jget $D/run.json group)" = workspace_group:9 ]'
 RUN2=$($O new-run --repo $R --title m3 --coordinator surface:30 --coordinator-workspace workspace:3); D2=$ORCH_HOME/runs/$RUN2
 printf '# A\n' > $D2/slices/A.md; env ORCH_SKIP_TRUST=1 ORCH_CMUX=$FAKE $O spawn --run $RUN2 --slice A >/dev/null 2>&1
-: > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN --status aborted --keep-sim
+: > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN --status aborted
 ok "group still used by another active run → kept" '[ $rc = 0 ] && ! grep -q "workspace-group ungroup" $FAKE_LOG'
-: > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN2 --status aborted --keep-sim
+: > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN2 --status aborted
 ok "last run of the group ends → ungroup" '[ $rc = 0 ] && grep -qx "workspace-group ungroup workspace_group:9" $FAKE_LOG'
 RUN3=$($O new-run --repo $R --title m3b --coordinator surface:30 --coordinator-workspace workspace:3); D3=$ORCH_HOME/runs/$RUN3
 RUN4=$($O new-run --repo $R --title m3c --coordinator surface:30 --coordinator-workspace workspace:3)   # older orch: no "group" stored
 printf '# A\n' > $D3/slices/A.md; env ORCH_SKIP_TRUST=1 ORCH_CMUX=$FAKE $O spawn --run $RUN3 --slice A >/dev/null 2>&1
-cp $FAKE_LOG $S/fake-m3.log; : > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN3 --status aborted --keep-sim
+cp $FAKE_LOG $S/fake-m3.log; : > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O end-run --run $RUN3 --status aborted
 ok "another active run on the same coordinator workspace (no group recorded) → kept" '[ $rc = 0 ] && ! grep -q "workspace-group ungroup" $FAKE_LOG'
-env ORCH_CMUX=$FAKE $O end-run --run $RUN4 --status aborted --keep-sim >/dev/null 2>&1; cp $S/fake-m3.log $FAKE_LOG
+env ORCH_CMUX=$FAKE $O end-run --run $RUN4 --status aborted >/dev/null 2>&1; cp $S/fake-m3.log $FAKE_LOG
 ok "ungroup comes after the worker workspaces close" '[ "$(grep -n "workspace close" $FAKE_LOG | tail -1 | cut -d: -f1)" -lt "$(grep -n ungroup $FAKE_LOG | cut -d: -f1)" ]'
 ok "M3/M5 never touched PATH cmux" '[ ! -s $PATHCMUX_LOG ]'
 
@@ -120,77 +120,67 @@ ok "ORCH_CMUX pointing nowhere → exit 2, names it" '[ $rc = 2 ] && grep -q "no
 run env PATH=$NOCMUX_PATH ORCH_SKIP_TRUST=1 $O spawn --run $RUN --slice A --dry-run
 ok "spawn --dry-run works without cmux" '[ $rc = 0 ] && grep -q "claude " <<< "$out"'
 echo '{"run":"'$RUN'","slice":"Z","name":"'$RUN'-Z","workspace":"surface:51","ws_ref":"workspace:5","status":"active"}' > $D/workers/Z.json
-run env PATH=$NOCMUX_PATH $O reap --keep-sim
+run env PATH=$NOCMUX_PATH $O reap
 ok "reap without cmux: no traceback" '[ $rc = 0 ] && ! grep -q Traceback <<< "$out"'
-run env PATH=$NOCMUX_PATH $O end-run --run $RUN --status aborted --keep-sim
+run env PATH=$NOCMUX_PATH $O end-run --run $RUN --status aborted
 ok "end-run without cmux: no traceback, run ended" '[ $rc = 0 ] && ! grep -q Traceback <<< "$out" && [ "$(jget $D/run.json status)" = aborted ]'
 
 echo "-- M1: doctor/reap treat run-prefixed and ops- owners as live"
 home m1; RUN=$($O new-run --repo $R --title m1 --coordinator workspace:0)
-$O resource-lock --name chrome --owner $RUN-integrate-verify --wait 0 >/dev/null
-$O resource-lock --name sim --owner ops-asc --wait 0 >/dev/null
+$O lock --repo $R --owner $RUN-integrate-verify iv.txt >/dev/null
+$O lock --repo $R --owner ops-asc asc.txt >/dev/null
 read PA PB < <($O ports --run $RUN --name integrate-verifier)
 OPSB=$((ORCH_PORT_BASE + 40)); mkdir -p $ORCH_HOME/locks/ports/$OPSB; echo '{"owner":"ops-console"}' > $ORCH_HOME/locks/ports/$OPSB/owner.json
 GONE=$((ORCH_PORT_BASE + 50)); mkdir -p $ORCH_HOME/locks/ports/$GONE; echo '{"owner":"0101-0000-gone-S1"}' > $ORCH_HOME/locks/ports/$GONE/owner.json
 $O lock --repo $R --owner $RUN-integrate-x f.txt >/dev/null; $O lock --repo $R --owner 0101-0000-gone-S1 g.txt >/dev/null
-$O merge-lock --repo $R --owner $RUN-integrate --wait 0 >/dev/null
+$O lock --repo $R --owner $RUN-integrate i.txt >/dev/null
 run $O doctor
 ok "doctor: no false orphans for run-prefixed / ops- owners" '! grep -E "orphan.*($RUN-|ops-)" <<< "$out"'
 ok "doctor: real orphans still reported" '[ "$(grep -c "orphan.*0101-0000-gone-S1" <<< "$out")" = 2 ]'
 run $O doctor --fix
-ok "doctor --fix keeps the integration chrome lock" '[ -f $ORCH_HOME/locks/resources/chrome/owner.json ]'
-ok "doctor --fix keeps the ops- sim lock" '[ -f $ORCH_HOME/locks/resources/sim/owner.json ]'
+ok "doctor --fix keeps the integration verifier's lock" '$O locks --repo $R | grep -q "$RUN-integrate-verify .*iv.txt"'
+ok "doctor --fix keeps the ops- lock" '$O locks --repo $R | grep -q "ops-asc .*asc.txt"'
 ok "doctor --fix keeps the integrate-verifier port block" '[ -d $ORCH_HOME/locks/ports/$PA ]'
 ok "doctor --fix keeps the ops- port block" '[ -d $ORCH_HOME/locks/ports/$OPSB ]'
 ok "doctor --fix keeps the run-prefixed file lock" '$O locks --repo $R | grep -q "$RUN-integrate-x"'
-ok "doctor --fix keeps the integration merge lock" '$O locks --repo $R | grep -q "MERGE LOCK: $RUN-integrate "'
+ok "doctor --fix keeps the integration's own lock" '$O locks --repo $R | grep -q "$RUN-integrate .*i.txt"'
 ok "doctor --fix releases real orphans" '[ ! -d $ORCH_HOME/locks/ports/$GONE ] && ! $O locks --repo $R | grep -q gone-S1'
 python3 -m http.server $OPSB --bind 127.0.0.1 >/dev/null 2>&1 & SRV=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do nc -z 127.0.0.1 $OPSB 2>/dev/null && break; sleep 0.3; done
-$O reap --keep-sim >/dev/null 2>&1
+$O reap >/dev/null 2>&1
 ok "reap keeps a server on an ops- port block" 'kill -0 $SRV 2>/dev/null'
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
-$O merge-unlock --repo $R --owner $RUN-integrate >/dev/null; $O end-run --run $RUN --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $RUN --status aborted >/dev/null 2>&1
 
-echo "-- M2: atomic lock acquisition, unlock without owner.json"
-home m2; $O merge-lock --repo $R --owner probe --wait 0 >/dev/null; MD=$(find $ORCH_HOME/locks -type d -name merge | head -1)
-$O merge-unlock --repo $R --owner probe >/dev/null
-mkdir -p $MD; run $O merge-lock --repo $R --owner x1 --wait 0
-ok "merge lock dir without owner.json (fresh) → held, not stolen" '[ $rc != 0 ] && grep -q BUSY <<< "$out" && [ ! -f $MD/owner.json ]'
-touch -t $(ago 10M) $MD; run $O merge-lock --repo $R --owner x1 --wait 0
-ok "...older than the grace period → taken" '[ $rc = 0 ] && grep -q "\"x1\"" $MD/owner.json'
-ok "no temp lock dirs left beside it" '[ "$(ls -A $(dirname $MD) | grep -cv -e "^merge$" -e "^files$")" = 0 ]'
-$O merge-unlock --repo $R --owner x1 >/dev/null
-mkdir -p $MD; run $O merge-unlock --repo $R --owner x1
-ok "merge-unlock refuses a lock without owner.json" '[ $rc != 0 ] && [ -d $MD ]'
-run $O merge-unlock --repo $R --owner x1 --force
-ok "merge-unlock --force removes it" '[ $rc = 0 ] && [ ! -e $MD ]'
-run $O merge-unlock --repo $R --owner x1
-ok "merge-unlock with nothing held is a no-op" '[ $rc = 0 ]'
-mkdir -p $S/slowbin; ln -sf $FAKE $S/slowbin/cmux   # the slow fake is also the PATH cmux here
-# race: slow `cmux identify` used to sit between mkdir and owner.json; a waiter saw {} (at=0 → expired) and stole it
-( IDENT_SLEEP=1 PATH=$S/slowbin:$PATH ORCH_CMUX=$FAKE $O merge-lock --repo $R --owner ra --wait 0 > $S/ra.out 2>&1; echo $? > $S/ra.rc ) &
-sleep 0.3
-( IDENT_SLEEP=1 PATH=$S/slowbin:$PATH ORCH_CMUX=$FAKE $O merge-lock --repo $R --owner rb --wait 0 > $S/rb.out 2>&1; echo $? > $S/rb.rc ) &
-wait
-ok "concurrent merge-lock: exactly one holder" '[ $(( $(cat $S/ra.rc) == 0 )) -ne $(( $(cat $S/rb.rc) == 0 )) ]'
-ok "...and owner.json names that holder" 'w=$([ "$(cat $S/ra.rc)" = 0 ] && echo ra || echo rb); grep -q "\"$w\"" $MD/owner.json'
-ok "...nobody 'stole' a half-made lock" '! grep -q stealing $S/ra.out $S/rb.out'
-rm -rf $MD
-# many waiters on one stale lock: the judge→steal gap let a waiter remove a lock another had retaken meanwhile
-bad=0; for t in $(seq 1 20); do rm -rf $MD; mkdir -p $MD; echo '{"owner":"old","workspace":"workspace:1","at":1}' > $MD/owner.json
-  for w in 1 2 3 4 5; do ( PATH=$S/slowbin:$PATH ORCH_CMUX=$FAKE $O merge-lock --repo $R --owner w$w --wait 0 >/dev/null 2>&1; echo $? > $S/w$w.rc ) & done; wait
-  n=0; for w in 1 2 3 4 5; do [ "$(cat $S/w$w.rc)" = 0 ] && n=$((n+1)); done; [ $n = 1 ] || bad=$((bad+1)); done
-ok "5 waiters steal one stale lock: exactly one holder in every trial (bad trials: $bad/20)" '[ $bad = 0 ]'
-rm -rf $MD
-RD=$ORCH_HOME/locks/resources/chrome; mkdir -p $RD; run $O resource-lock --name chrome --owner y1 --wait 0
-ok "resource lock without owner.json (fresh) → held" '[ $rc != 0 ] && grep -q BUSY <<< "$out"'
-run $O resource-unlock --name chrome --owner y1
-ok "resource-unlock refuses a lock without owner.json" '[ $rc != 0 ] && [ -d $RD ]'
-run $O resource-unlock --name chrome --owner y1 --force
-ok "resource-unlock --force removes it" '[ $rc = 0 ] && [ ! -e $RD ]'
-run $O resource-lock --name chrome --owner y1 --wait 0
-ok "resource-lock acquires with owner.json in place" '[ $rc = 0 ] && grep -q "\"y1\"" $RD/owner.json && [ "$(ls -A $ORCH_HOME/locks/resources)" = chrome ]'
+echo "-- M2: atomic file-lock acquisition, an ownerless lock dir is never taken or unlocked"
+home m2; M2R=$($O new-run --repo $R --title m2 --coordinator workspace:0)        # doctor scans active runs' repos
+$O lock --repo $R --owner probe m.txt >/dev/null; FD=$(dirname "$(grep -l '"m.txt"' $ORCH_HOME/locks/*/files/*/owner.json)")
+$O unlock --repo $R --owner probe m.txt >/dev/null
+mkdir -p $FD; run $O lock --repo $R --owner x1 m.txt
+ok "file lock dir without owner.json → held, not taken" '[ $rc != 0 ] && grep -q "LOCKED m.txt" <<< "$out" && [ ! -f $FD/owner.json ]'
+run $O unlock --repo $R --owner x1 m.txt
+ok "unlock leaves a lock dir without owner.json alone" '[ $rc = 0 ] && [ -d $FD ]'
+run $O doctor --fix
+ok "doctor --fix keeps a fresh ownerless lock dir (a taker may be mid-write)" '[ -d $FD ] && ! grep -q orphan <<< "$out"'
+touch -t $(ago 10M) $FD; run $O doctor --fix
+ok "...older than the grace period → doctor --fix releases it" '[ ! -e $FD ] && grep -q "orphan file lock" <<< "$out"'
+run $O lock --repo $R --owner x1 m.txt
+ok "lock takes it with owner.json in place, no temp lock dirs left" '[ $rc = 0 ] && grep -q "\"x1\"" $FD/owner.json && [ -z "$(ls -A $ORCH_HOME/locks/.tmp)" ] && [ "$(ls -A $(dirname $FD))" = "$(basename $FD)" ]'
+$O unlock --repo $R --owner x1 m.txt >/dev/null
+# concurrent takers of one lock: the exists-check and the rename into place must not let two of them win
+bad=0; for t in $(seq 1 20); do rm -rf $FD
+  for w in 1 2 3 4 5; do ( $O lock --repo $R --owner w$w m.txt >/dev/null 2>&1; echo $? > $S/w$w.rc ) & done; wait
+  n=0; win=; for w in 1 2 3 4 5; do [ "$(cat $S/w$w.rc)" = 0 ] && { n=$((n+1)); win=w$w; }; done
+  { [ $n = 1 ] && grep -q "\"$win\"" $FD/owner.json; } || bad=$((bad+1)); done
+ok "5 concurrent takers of one file lock: exactly one holder, named in owner.json (bad trials: $bad/20)" '[ $bad = 0 ]'
+# judge→steal gap (doctor --fix, unlock): a lock retaken after it was judged must be left alone
+rm -rf $FD; $O lock --repo $R --owner new m.txt >/dev/null
+run python3 -c 'import importlib.machinery as m, importlib.util as u, json, pathlib, sys
+s = u.spec_from_loader("orch", m.SourceFileLoader("orch", sys.argv[1])); o = u.module_from_spec(s); s.loader.exec_module(o); d = pathlib.Path(sys.argv[2])
+old = {"owner": "old", "file": "m.txt", "at": 1}; cur = json.load(open(d / "owner.json"))
+print(o.steal_lock(d, old), d.is_dir(), o.steal_lock(d, cur), d.exists())' $O $FD
+ok "steal_lock leaves a lock retaken since it was judged, removes the one it judged" '[ "$out" = "False True True False" ]'
+rm -rf $FD; $O end-run --run $M2R --status aborted >/dev/null 2>&1
 
 echo "-- gc of ended runs + end-run drops watch state"
 home gc; mk(){ $O new-run --repo $R --title "$1" --coordinator workspace:0; }
@@ -200,9 +190,9 @@ for r in $OLD $NEW $ACT $NOEND; do d=$ORCH_HOME/runs/$r
   echo x > $d/slices/S1.md; echo y > $d/slices/S1.progress.md; echo '{}' > $d/workers/S1.json
   mkdir -p $d/artifacts/lab/.venv; head -c 20000 /dev/zero > $d/artifacts/lab/.venv/blob; mkdir -p $d/audit; echo a > $d/audit/a.md; done
 mkdir -p $ORCH_HOME/state; for r in $OLD $NEW $ACT; do echo '{}' > $ORCH_HOME/state/watch-$r.json; done
-$O end-run --run $OLD --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $OLD --status aborted >/dev/null 2>&1
 ok "end-run deletes its watch state" '[ ! -e $ORCH_HOME/state/watch-$OLD.json ] && [ -e $ORCH_HOME/state/watch-$ACT.json ]'
-$O end-run --run $NEW --status aborted --keep-sim >/dev/null 2>&1; $O end-run --run $NOEND --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $NEW --status aborted >/dev/null 2>&1; $O end-run --run $NOEND --status aborted >/dev/null 2>&1
 setrun $OLD ended 20d; setrun $NEW ended 3d; setrun $ACT created 40d
 python3 -c 'import json,sys;p=sys.argv[1];r=json.load(open(p));r.pop("ended");json.dump(r,open(p,"w"))' $ORCH_HOME/runs/$NOEND/run.json
 echo '{}' > $ORCH_HOME/state/watch-$OLD.json
@@ -230,29 +220,29 @@ pair(){ local i; for i in 1 2 3; do home pfx-$1-$i   # fresh home per try: a min
   [ "$P2" = "$P1-2" ] && return; done; }
 pair dup; X=$P1; X2=$P2
 read XA XB < <($O ports --run $X2 --name S1)
-$O end-run --run $X --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $X --status aborted >/dev/null 2>&1
 ok "end-run X keeps X-2's port block ($X2)" '[ "$X2" = "$X-2" ] && [ -d $ORCH_HOME/locks/ports/$XA ]'
 pair yy; Y=$P1; Y2=$P2
-$O resource-lock --name chrome --owner $Y2-integrate-verifier-verify --wait 0 >/dev/null; $O lock --repo $R --owner $Y2-S4 pre.txt >/dev/null
-$O end-run --run $Y2 --status aborted --keep-sim >/dev/null 2>&1
-ok "end-run frees every lock under its names (non-standard integration owner, pre-spawn file lock)" '[ ! -e $ORCH_HOME/locks/resources/chrome ] && ! $O locks --repo $R | grep -q pre.txt'
-$O resource-lock --name chrome --owner $Y2-S1-verify --wait 0 >/dev/null              # a leftover taken after Y-2 ended
+$O lock --repo $R --owner $Y2-integrate-verifier-verify ivv.txt >/dev/null; $O lock --repo $R --owner $Y2-S4 pre.txt >/dev/null
+$O end-run --run $Y2 --status aborted >/dev/null 2>&1
+ok "end-run frees every lock under its names (non-standard integration owner, pre-spawn file lock)" '! $O locks --repo $R | grep -qE "ivv.txt|pre.txt"'
+$O lock --repo $R --owner $Y2-S1-verify left.txt >/dev/null                           # a leftover taken after Y-2 ended
 run $O doctor --fix
-ok "ended Y-2's lock is an orphan while Y is active" '[ "$Y2" = "$Y-2" ] && grep -q "orphan chrome lock by $Y2-S1-verify" <<< "$out" && [ ! -e $ORCH_HOME/locks/resources/chrome ]'
+ok "ended Y-2's lock is an orphan while Y is active" '[ "$Y2" = "$Y-2" ] && grep -q "orphan file lock left.txt by $Y2-S1-verify" <<< "$out" && ! $O locks --repo $R | grep -q left.txt'
 echo '{"run":"'$Y'","slice":"S1","name":"'$Y'-S1","status":"merged"}' > $ORCH_HOME/runs/$Y/workers/S1.json
-$O resource-lock --name sim --owner $Y-S10-verify --wait 0 >/dev/null
+$O lock --repo $R --owner $Y-S10-verify s10.txt >/dev/null
 $O close --run $Y --slice S1 >/dev/null 2>&1
-ok "closing S1 leaves S10's sim lock" '[ -f $ORCH_HOME/locks/resources/sim/owner.json ]'
-$O resource-unlock --name sim --owner $Y-S10-verify >/dev/null; $O end-run --run $Y --status aborted --keep-sim >/dev/null 2>&1
+ok "closing S1 leaves S10's verify lock" '$O locks --repo $R | grep -q "$Y-S10-verify .*s10.txt"'
+$O unlock --repo $R --owner $Y-S10-verify >/dev/null; $O end-run --run $Y --status aborted >/dev/null 2>&1
 
 echo "-- cmux failing (not running) = liveness unknown, nobody marked dead"
 home ce; CE=$($O new-run --repo $R --title ce --coordinator workspace:0)
 echo '{"run":"'$CE'","slice":"A","name":"'$CE'-A","workspace":"surface:51","status":"active"}' > $ORCH_HOME/runs/$CE/workers/A.json
-$O reap --keep-sim >/dev/null 2>&1                                                  # PATH cmux here exits 1
+$O reap >/dev/null 2>&1                                                  # PATH cmux here exits 1
 ok "reap with cmux exiting 1 keeps the worker active" '[ "$(jget $ORCH_HOME/runs/$CE/workers/A.json status)" = active ]'
 $O doctor --fix >/dev/null 2>&1
 ok "doctor --fix with cmux exiting 1 keeps it active" '[ "$(jget $ORCH_HOME/runs/$CE/workers/A.json status)" = active ]'
-$O end-run --run $CE --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $CE --status aborted >/dev/null 2>&1
 
 echo "-- finished workers' locks are orphans; active/dead (resumable) workers' and coordinator jobs' are not"
 home fin; Z=$($O new-run --repo $R --title fin --coordinator workspace:0); ZD=$ORCH_HOME/runs/$Z
@@ -260,15 +250,15 @@ wkr(){ echo '{"run":"'$Z'","slice":"'$1'","name":"'$Z-$1'","workspace":"surface:
 wkr S1 merged; wkr S2 active; wkr S3 dead; wkr api merged
 $O lock --repo $R --owner $Z-S1 done.txt >/dev/null; $O lock --repo $R --owner $Z-S2 live.txt >/dev/null
 $O lock --repo $R --owner $Z-S3 dead.txt >/dev/null; $O lock --repo $R --owner $Z-api-auth auth.txt >/dev/null   # api-auth not spawned yet
-$O resource-lock --name chrome --owner $Z-S1-verify --wait 0 >/dev/null; $O resource-lock --name sim --owner $Z-integrate-verify --wait 0 >/dev/null
+$O lock --repo $R --owner $Z-S1-verify v1.txt >/dev/null; $O lock --repo $R --owner $Z-integrate-verify iv.txt >/dev/null
 run env ORCH_CMUX=$FAKE $O doctor --fix
-ok "merged worker's file lock and -verify lock released" '! $O locks --repo $R | grep -q done.txt && [ ! -e $ORCH_HOME/locks/resources/chrome ]'
-ok "active worker's file lock and coordinator job's lock kept" '$O locks --repo $R | grep -q live.txt && [ -f $ORCH_HOME/locks/resources/sim/owner.json ]'
+ok "merged worker's file lock and -verify lock released" '! $O locks --repo $R | grep -qE "done.txt|v1.txt"'
+ok "active worker's file lock and coordinator job's lock kept" '$O locks --repo $R | grep -q live.txt && $O locks --repo $R | grep -q iv.txt'
 ok "dead worker's file lock kept for --resume" '$O locks --repo $R | grep -q dead.txt'
 ok "lock for slice api-auth (taken before spawn) isn't matched to finished worker api" '$O locks --repo $R | grep -q auth.txt'
-$O resource-lock --name chrome --owner $Z-api-docs-verify --wait 0 >/dev/null; $O close --run $Z --slice api >/dev/null 2>&1
-ok "closing slice api leaves api-docs's verify lock" '[ -f $ORCH_HOME/locks/resources/chrome/owner.json ]'
-$O resource-unlock --name chrome --owner $Z-api-docs-verify >/dev/null
+$O lock --repo $R --owner $Z-api-docs-verify docs.txt >/dev/null; $O close --run $Z --slice api >/dev/null 2>&1
+ok "closing slice api leaves api-docs's verify lock" '$O locks --repo $R | grep -q "$Z-api-docs-verify .*docs.txt"'
+$O unlock --repo $R --owner $Z-api-docs-verify >/dev/null
 printf "# S3\n" > $ZD/slices/S3.md; run env ORCH_SKIP_TRUST=1 $O spawn --run $Z --slice S3 --resume --dry-run
 ok "spawn --resume with no worktree → refused, no port block taken" '[ $rc != 0 ] && grep -q "no worktree" <<< "$out" && ! grep -rqs "\"$Z-S3\"" $ORCH_HOME/locks/ports'
 printf '# S4\n' > $ZD/slices/S4.md; run env ORCH_SKIP_TRUST=1 ORCH_CMUX=$FAKE $O spawn --run $Z --slice S4 --resume
@@ -280,37 +270,37 @@ $O ports --run $Z --name iv --release >/dev/null
 echo '{"dash_ws":"workspace:5"}' > /dev/null; python3 -c 'import json,sys;p=sys.argv[1];r=json.load(open(p));r["dash_ws"]="workspace:5";json.dump(r,open(p,"w"))' $ZD/run.json
 : > $FAKE_LOG; run env ORCH_CMUX=$FAKE TREE_FAIL=1 $O dash --run $Z --open
 ok "dash --open with liveness unknown doesn't open a second dashboard" '! grep -q "^new-workspace" $FAKE_LOG'
-rm -rf $ORCH_HOME/locks/resources/chrome; chmod 500 $ORCH_HOME/locks/resources
+FL=$(dirname "$(dirname "$(grep -l '"live.txt"' $ORCH_HOME/locks/*/files/*/owner.json)")"); chmod 500 $FL   # files/ not writable
 run python3 -c 'import subprocess,sys
 try: r=subprocess.run(sys.argv[1:],capture_output=True,text=True,timeout=8); print(r.stdout+r.stderr); sys.exit(r.returncode)
-except subprocess.TimeoutExpired: print("HUNG"); sys.exit(124)' $O resource-lock --name chrome --owner q --wait 0
-chmod 700 $ORCH_HOME/locks/resources
+except subprocess.TimeoutExpired: print("HUNG"); sys.exit(124)' $O lock --repo $R --owner q q.txt
+chmod 700 $FL
 ok "lock dir that can't be created → error, not a busy loop" '[ $rc != 0 ] && [ $rc != 124 ] && grep -q "could not create lock" <<< "$out"'
-$O resource-unlock --name sim --owner $Z-integrate-verify >/dev/null; $O end-run --run $Z --status aborted --keep-sim >/dev/null 2>&1
+$O unlock --repo $R --owner $Z-integrate-verify >/dev/null; $O end-run --run $Z --status aborted >/dev/null 2>&1
 
 echo "-- a run whose workers all died (port blocks left behind) still goes idle"
 home dead; DR=$($O new-run --repo $R --title dead --coordinator workspace:0)
 echo '{"run":"'$DR'","slice":"S1","name":"'$DR'-S1","status":"dead","died":"2020-01-01T00:00:00"}' > $ORCH_HOME/runs/$DR/workers/S1.json
 DB=$((ORCH_PORT_BASE + 60)); mkdir -p $ORCH_HOME/locks/ports/$DB; echo '{"owner":"'$DR'-S1"}' > $ORCH_HOME/locks/ports/$DB/owner.json
 setrun $DR created 13h; find $ORCH_HOME/runs/$DR -type f -exec touch -t $(ago 13H) {} +
-run $O reap --keep-sim
+run $O reap
 ok "dead worker's leftover port block doesn't keep the run busy" 'grep -q "IDLE run $DR" <<< "$out"'
-$O end-run --run $DR --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $DR --status aborted >/dev/null 2>&1
 
 echo "-- an active run holding integration ports/locks is not idle"
 home busy; CP=$ORCH_HOME/state/caffeinate.pid; BR=$($O new-run --repo $R --title busy --coordinator workspace:0)
 read BA BB < <($O ports --run $BR --name integrate-verifier); $O lock --repo $R --owner $BR-S5 pre5.txt >/dev/null
 setrun $BR created 13h; find $ORCH_HOME/runs/$BR -type f -exec touch -t $(ago 13H) {} +
-run $O reap --keep-sim
+run $O reap
 ok "integration port block / pre-spawn lock taken just now → not IDLE, caffeinate kept" '! grep -q IDLE <<< "$out" && [ -f $CP ] && kill -0 "$(cat $CP)" 2>/dev/null'
 old_at(){ python3 -c 'import json,sys,time;p=sys.argv[1];o=json.load(open(p));o["at"]=time.strftime("%Y-%m-%dT%H:%M:%S",time.localtime(time.time()-13*3600));json.dump(o,open(p,"w"))' "$1"; }
 old_at $ORCH_HOME/locks/ports/$BA/owner.json
-run $O reap --dry-run --keep-sim
+run $O reap --dry-run
 ok "...pre-spawn file lock still fresh → not IDLE" '! grep -q IDLE <<< "$out"'
 for f in $(find $ORCH_HOME/locks -path "*/files/*/owner.json"); do old_at $f; done
-run $O reap --dry-run --keep-sim
+run $O reap --dry-run
 ok "port block and pre-spawn file lock both 13h old (leftover reservations) → IDLE" 'grep -q "IDLE run $BR" <<< "$out"'
-$O end-run --run $BR --status aborted --keep-sim >/dev/null 2>&1
+$O end-run --run $BR --status aborted >/dev/null 2>&1
 
 echo "-- ORCH_CMUX that exists but can't run: no traceback"
 home badcmux; BC=$($O new-run --repo $R --title bc --coordinator surface:30 --coordinator-workspace workspace:3); BD=$ORCH_HOME/runs/$BC
@@ -321,7 +311,7 @@ ok "broadcast with a #!-less ORCH_CMUX → UNDELIVERED, no traceback" '[ $rc = 0
 run env ORCH_CMUX=$S/noexec-cmux $O broadcast --run $BC hi
 ok "broadcast with a non-executable ORCH_CMUX → exit 2, one line" '[ $rc = 2 ] && [ "$(grep -c . <<< "$out")" = 1 ]'
 python3 -c 'import json,sys;p=sys.argv[1];r=json.load(open(p));r["dash_ws"]="workspace:9";json.dump(r,open(p,"w"))' $BD/run.json
-run env ORCH_CMUX=$S/noshebang-cmux $O end-run --run $BC --status aborted --keep-sim
+run env ORCH_CMUX=$S/noshebang-cmux $O end-run --run $BC --status aborted
 ok "end-run with a #!-less ORCH_CMUX completes (run ended, no traceback)" '[ $rc = 0 ] && ! grep -q Traceback <<< "$out" && [ "$(jget $BD/run.json status)" = aborted ]'
 
 echo "-- reap flags idle active runs, releases caffeinate"
@@ -330,25 +320,25 @@ IR=$($O new-run --repo $R --title idle --coordinator surface:30 --coordinator-wo
 echo '{"run":"'$IR'","slice":"A","name":"'$IR'-A","status":"merged","started":"2020-01-01T00:00:00","merged":"2020-01-01T01:00:00"}' > $ORCH_HOME/runs/$IR/workers/A.json
 setrun $IR created 13h; find $ORCH_HOME/runs/$IR -type f -exec touch -t $(ago 13H) {} +
 ok "caffeinate held" 'alive'
-run $O reap --keep-sim
+run $O reap
 ok "reap flags the run idle >12h" 'grep -E "IDLE.*$IR" -q <<< "$out"'
 ok "...not the fresh one" '! grep -E "IDLE.*$FR" -q <<< "$out"'
 ok "...caffeinate kept while another active run is not idle" 'alive'
-$O end-run --run $FR --status aborted --keep-sim >/dev/null 2>&1; ok "caffeinate kept: idle run still active" 'alive'
-CPID=$(cat $CP); run $O reap --dry-run --keep-sim
+$O end-run --run $FR --status aborted >/dev/null 2>&1; ok "caffeinate kept: idle run still active" 'alive'
+CPID=$(cat $CP); run $O reap --dry-run
 ok "reap --dry-run flags but releases nothing" 'grep -q "IDLE.*$IR" <<< "$out" && alive'
-run $O reap --keep-sim
+run $O reap
 ok "all active runs idle → caffeinate released" '! alive && ! kill -0 $CPID 2>/dev/null && grep -qi "caffeinate released" <<< "$out"'
 ok "idle run is not ended" '[ "$(jget $ORCH_HOME/runs/$IR/run.json status)" = active ]'
 $O note --run $IR --wait "back on it" >/dev/null; ok "coordinator's orch note on the idle run holds caffeinate again" 'alive'
-touch -t $(ago 13H) $ORCH_HOME/runs/$IR/waiting.json; $O reap --keep-sim >/dev/null; ok "(released again)" '! alive'
+touch -t $(ago 13H) $ORCH_HOME/runs/$IR/waiting.json; $O reap >/dev/null; ok "(released again)" '! alive'
 read IA IB < <($O ports --run $IR --name integrate-verifier); ok "orch ports (integration) holds caffeinate again" 'alive'
 $O ports --run $IR --name integrate-verifier --release >/dev/null
 printf '# B\n' > $ORCH_HOME/runs/$IR/slices/B.md
 env ORCH_SKIP_TRUST=1 ORCH_CMUX=$FAKE $O spawn --run $IR --slice B >/dev/null 2>&1
 ok "spawning on the idle run holds caffeinate again" 'alive'
-run env ORCH_CMUX=$FAKE $O reap --keep-sim
+run env ORCH_CMUX=$FAKE $O reap
 ok "run with an active worker is not idle" '! grep -q "IDLE" <<< "$out" && alive'
-env ORCH_CMUX=$FAKE $O end-run --run $IR --status aborted --keep-sim >/dev/null 2>&1
+env ORCH_CMUX=$FAKE $O end-run --run $IR --status aborted >/dev/null 2>&1
 
 echo "PASSED $P FAILED $F"; [ $F = 0 ]
