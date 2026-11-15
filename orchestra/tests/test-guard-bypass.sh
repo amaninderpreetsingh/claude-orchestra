@@ -407,6 +407,22 @@ kill -9 $SUP 2>/dev/null; wait $SUP 2>/dev/null
 for i in $(seq 1 20); do kill -0 ${KID:-0} 2>/dev/null || break; sleep 0.1; done
 ok "a hung child whose supervisor was killed (Claude Code's hook timeout) ends at once, never lingers" "! kill -0 ${KID:-0} 2>/dev/null"
 [ -n "$KID" ] && kill -9 $KID 2>/dev/null
+python3 - "$S" <<'PY'
+import sys
+out = sys.argv[1] + "/pg-hang.py"
+src, m = open(out).read(), 'if __name__ == "__main__":\n'
+assert m in src
+# a slow start (a cold interpreter): the supervisor is killed before the child has begun its orphan watch
+open(sys.argv[1] + "/pg-slow.py", "w").write(src.replace(
+    m, m + '    import time as _t\n    _t.sleep(1) if os.environ.get(CHILD) == "1" else None\n', 1))
+PY
+python3 $S/pg-slow.py < $S/hang.json >/dev/null 2>&1 & SUP=$!; KID=
+for i in $(seq 1 500); do KID=$(pgrep -P $SUP | head -1); [ -n "$KID" ] && break; sleep 0.01; done
+ok "(the slow-starting child is up before its supervisor is killed)" "[ -n \"$KID\" ]"
+kill -9 $SUP 2>/dev/null; wait $SUP 2>/dev/null
+for i in $(seq 1 20); do kill -0 ${KID:-0} 2>/dev/null || break; sleep 0.1; done
+ok "a child whose supervisor was killed before its orphan watch began ends within 2s, never lingers" "! kill -0 ${KID:-0} 2>/dev/null"
+[ -n "$KID" ] && kill -9 $KID 2>/dev/null
 
 echo "-- SIGTERM/SIGHUP to the supervisor (a cancelled hook) fails closed like a crash, never exit 143/129"
 printf '{"tool_name":"Bash","cwd":"/","tool_input":{"command":"ls -la"}}' > $S/hang-ls.json

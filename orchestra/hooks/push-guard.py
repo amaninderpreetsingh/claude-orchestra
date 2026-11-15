@@ -140,6 +140,8 @@ def deadline():
 
 
 CHILD = "ORCH_GUARD_CHILD"  # set in the child that runs the checks
+PARENT = "ORCH_GUARD_PARENT"  # the supervisor's pid, given to that child: its orphan watch never misses a supervisor
+                              # killed before the watch began (by then the child is reparented, getppid() is 1)
 HARD_MARGIN = 5.0  # the supervisor's wall clock: deadline + this, still under Claude Code's 60s hook timeout
 
 
@@ -176,7 +178,8 @@ def supervise():
     limit = deadline() + HARD_MARGIN
     try:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, **{CHILD: "1"}),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=dict(os.environ, **{CHILD: "1", PARENT: str(os.getpid())}),
                              start_new_session=True)  # its own group: a kill reaches the git calls it started
         proc["p"] = p
     except Exception as e:
@@ -201,11 +204,17 @@ def supervise():
     os._exit(1)
 
 
-def orphan_watch():
+def orphan_watch(parent):
     """In the child (its own process group): end the group (itself and its git calls) once the supervisor is gone
-    (killed by Claude Code's hook timeout) or the hard limit has passed, so a hung child never lingers."""
+    (killed by Claude Code's hook timeout) or the hard limit has passed, so a hung child never lingers. parent is the
+    supervisor's pid as it passed it; already not our parent → it died before this watch began: end at once. Without
+    it (the child started some other way) the parent is whoever it is now."""
     import signal, threading, time
-    ppid, end = os.getppid(), time.monotonic() + deadline() + HARD_MARGIN
+    try:
+        ppid = int(parent)
+    except (TypeError, ValueError):
+        ppid = os.getppid()
+    end = time.monotonic() + deadline() + HARD_MARGIN
 
     def watch():
         while os.getppid() == ppid and time.monotonic() < end:
@@ -220,7 +229,7 @@ if __name__ == "__main__":
     sys.excepthook = _crashed
     if os.environ.pop(CHILD, None) != "1":
         supervise()
-    orphan_watch()
+    orphan_watch(os.environ.pop(PARENT, None))
 
 import codecs, re, shlex, signal, subprocess, time
 from pathlib import Path
