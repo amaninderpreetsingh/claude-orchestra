@@ -2,7 +2,7 @@
 """PreToolUse(Bash) guard-rail, three rules. A denial exits 2 with one line on stderr; anything else gets no decision
 (exit 0, no output), so the user's own permission rules decide: it never allows or asks.
 1. Nobody force-pushes: git push with --force, -f (in a cluster too: -uf), --force-with-lease[=…], --force-if-includes
-   --mirror (or an abbreviation git accepts: --forc, --mirr), a + refspec, or -c remote.*.mirror / .push=+….
+   --mirror (or an abbreviation git accepts: --m, --forc, --mirr), a + refspec, or -c remote.*.mirror / .push=+….
 2. A registered worker (orchestra-owner.json in its worktree's git dir, from `orch register`) runs no git … push.
 3. A worker's cmux is only `agent message <its coordinator>` (short ref or stable id, owner record else run.json),
    `agent message --reply-to <id>`, `identify`, `read-screen --surface <its own>`; no CMUX_* variable or orch broadcast.
@@ -42,10 +42,11 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "source", ".", "su"}
 RUNNERS = {"eval": 0, "watch": 0, "ssh": 1}  # they join their words into one command line (ssh: past its host)
 INTERPRETERS = re.compile(r"python[\d.]*|pypy3?|perl|ruby|node|deno|bun|php|osascript|lua|tclsh")
 WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "sudo", "doas", "time", "timeout", "nice", "xargs",
-            "caffeinate", "stdbuf", "if", "then", "else", "elif", "do", "while", "until", "!", "{", "function"}
+            "caffeinate", "stdbuf", "arch", "if", "then", "else", "elif", "do", "while", "until", "!", "{", "function"}
 VALUE_OPTS = {"sudo": "ugCDhpRTU user group chdir", "doas": "uC", "env": "uCS unset chdir", "timeout": "sk signal "
               "kill-after", "nice": "n adjustment", "xargs": "ILnPdEsa max-args max-procs delimiter eof arg-file",
-              "stdbuf": "ioe", "watch": "nd interval", "ssh": "bcDEeFIiJLlmOopQRSWw"}  # value-taking short, long
+              "stdbuf": "ioe", "watch": "nd interval", "ssh": "bcDEeFIiJLlmOopQRSWw",
+              "arch": "de rch arch d e"}  # value-taking short, long (arch: -arch reads as "rch"; --arch, --d, --e)
 SETTERS = {"export", "read", "declare", "typeset", "local", "readonly", "printf"}  # can set a CMUX_* variable
 GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
 FORCE_LONG = ("force", "force-with-lease", "force-if-includes", "mirror")
@@ -153,7 +154,7 @@ def push_args(args):
 def forced(args):
     for a in (p for a in args for p in re.split(r"[{,}]", a)):  # each brace alternative: {+main,x}, {-f,}
         n = a[2:].partition("=")[0]
-        if (a[:2] == "--" and len(n) > 1 and any(f.startswith(n) for f in FORCE_LONG) or a[:1] == "+" and len(a) > 1
+        if (a[:2] == "--" and n and any(f.startswith(n) for f in FORCE_LONG) or a[:1] == "+" and len(a) > 1
                 or a[:1] == "-" != a[1:2] and "f" in a[1:].partition("o")[0]):  # --forc, +main, -uf; not -o<value>
             return True
     return False
