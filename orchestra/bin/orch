@@ -5,7 +5,7 @@ State lives in ~/.claude/orchestra/. Several coordinators (one per cmux chat) ca
 once on the same or different repos. File ownership is an atomic mkdir lock keyed by repo;
 each worker gets its own port block.
 
-Run:          new-run, run-branch, baseline, criteria-init, criteria-add, criteria-check, end-run
+Run:          new-run, run-branch, baseline, criteria-init, criteria-add, criteria-check, merge, ship, end-run
 Workers:      spawn (--dry-run), close, add-worker, finish-worker, broadcast, ports
 Files/locks:  lock, unlock, locks
 Health:       doctor (--fix), reap, status, report, dash, note, gc (deletes ended runs' bulk)
@@ -125,11 +125,14 @@ def cmux(*args, timeout=10):
         return subprocess.CompletedProcess([CMUX, *args], 124, "", "cmux timed out")
 
 
-def cmux_identify():
-    try:
-        return json.loads(cmux("identify", "--json").stdout)["caller"]
-    except Exception:
-        return {}
+def cmux_identify(ids=False):
+    """The caller's refs; ids=True adds its stable uuids (surface_id, workspace_id) where this cmux reports them."""
+    for args in ((["--id-format", "both"], []) if ids else ([],)):
+        try:
+            return json.loads(cmux("identify", "--json", *args).stdout)["caller"]
+        except Exception:
+            continue
+    return {}
 
 
 def cmux_workspace():
@@ -363,10 +366,15 @@ def cmd_new_run(a):
     if ".claude/worktrees/" not in (excl.read_text() if excl.exists() else ""):
         with open(excl, "a") as f:  # keep worker worktrees out of `git add .` without touching tracked files
             f.write("\n.claude/worktrees/\n")
+    me = cmux_identify(ids=True) if not (a.coordinator and a.coordinator_workspace) else {}
+    coord = a.coordinator or me.get("surface_ref")
+    # the coordinator's stable surface uuid (a surface:N is reused once it closes): the guard and orch-watch use it
+    coord_id = me.get("surface_id") if coord and coord == me.get("surface_ref") else (
+        ((cmux_nodes() or {}).get(coord) or (None,))[0] if coord and me and have_cmux() else None)
     info = {"title": a.title, "repo": root, "repo_slug": slug_of(root),
             "default_branch": b, "target": b, "base_sha": git(root, "rev-parse", f"origin/{b}"),
-            "coordinator": a.coordinator or cmux_workspace(),
-            "coordinator_workspace": a.coordinator_workspace or cmux_identify().get("workspace_ref"),
+            "coordinator": coord, "coordinator_id": coord_id,
+            "coordinator_workspace": a.coordinator_workspace or me.get("workspace_ref"),
             "status": "active", "created": now()}
     RUNS.mkdir(parents=True, exist_ok=True)
     for n in range(1, 1000):  # same title twice in one minute → -2, -3 (mkdir claims the id atomically)
@@ -386,17 +394,49 @@ def cmd_new_run(a):
     print(run_id)
 
 
+def feature_dir(run):
+    return RUNS / run / "feature"
+
+
 def cmd_run_branch(a):
-    """Multi-slice runs: create origin/orch/<run> at origin/<default>; workers push there."""
+    """The run's feature branch: orch/<run> from origin/<default>, checked out in the feature worktree
+    runs/<run>/feature (where merge and ship work), pushed to origin, recorded as the run's target.
+    Never an owner record there: the guard treats every checkout that has one as a worker's (no pushes)."""
     p = RUNS / a.run / "run.json"
     r = read_json(p) or sys.exit(f"orch: no run {a.run}")
-    br = f"orch/{a.run}"
-    git(r["repo"], "fetch", "--quiet", "origin")
-    git(r["repo"], "push", "--quiet", "origin", f"origin/{r['default_branch']}:refs/heads/{br}")
-    git(r["repo"], "fetch", "--quiet", "origin")
-    r["target"] = br
+    if r.get("shipped"):
+        sys.exit(f"orch: {a.run} already shipped {r['shipped'][:12]} — nothing to set up (orch end-run next)")
+    with feature_lock(a.run):
+        run_branch(a, p, r)
+
+
+def run_branch(a, p, r):
+    root, br, feat = r["repo"], f"orch/{a.run}", feature_dir(a.run)
+    git(root, "fetch", "--quiet", "origin")
+    remote = git(root, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", check=False)
+    if not feat.exists():
+        git(root, "worktree", "prune", check=False)  # a feature dir deleted by hand is still registered otherwise
+        have = git(root, "rev-parse", "-q", "--verify", f"refs/heads/{br}", check=False)
+        # rebuilt (feature dir gone) from what origin already holds: merged work is never started over from <default>
+        git(root, "worktree", "add", "--quiet", *([str(feat), br] if have else ["--no-track", "-b", br, str(feat),
+                                                   f"origin/{br}" if remote else f"origin/{r['default_branch']}"]))
+    elif git(feat, "symbolic-ref", "--short", "HEAD", check=False) != br:
+        sys.exit(f"orch: {feat} exists but isn't on {br}")
+    local = git(feat, "rev-parse", "HEAD")
+    rb = r.get("rebased") or {}
+    if not remote or (local != remote and anc_or_fail(feat, remote, local)):
+        git(feat, "push", "--quiet", "origin", f"refs/heads/{br}:refs/heads/{br}")  # new, or ahead: a fast-forward
+    elif local != remote and anc_or_fail(feat, local, remote):
+        if git(feat, "status", "--porcelain", "--untracked-files=no"):
+            sys.exit(f"orch: {feat} is behind origin/{br} and has uncommitted changes — nothing done")
+        git(feat, "merge", "--ff-only", "--quiet", remote)  # a reused local branch behind origin catches up
+    elif local != remote and not carries(feat, remote, local, rb):  # carried: ship's own rebase, left as it is
+        sys.exit(f"orch: {br} ({local[:12]}) and origin/{br} ({remote[:12]}) have diverged — nothing pushed")
+    git(root, "fetch", "--quiet", "origin")
+    r = read_json(p) or r  # fresh copy: don't undo a write made since we read it
+    r.update(target=br, feature=str(feat))
     write_json(p, r)
-    print(br)
+    print(f"{br} → {feat}")
 
 
 def cmd_baseline(a):
@@ -439,7 +479,7 @@ def cmd_add_worker(a):
         "run": a.run, "slice": a.slice, "name": f"{a.run}-{a.slice}", "workspace": a.workspace,
         "surface_id": node[0] if node else None,  # stable: close/liveness/messages use it (a surface:N is reused)
         "target": r["target"], "status": "active", "started": now()})
-    print(f"{a.run}-{a.slice} → pushes to {r['target']}")
+    print(f"{a.run}-{a.slice} → works on {r['target']}")
 
 
 def cmd_lock(a):
@@ -652,7 +692,7 @@ def cmd_spawn(a):
     msg = open_dash(a.run)
     if msg:
         print(msg)
-    print(f"{name} → workspace {wm.group(0)} ({surface}) in {group or 'no group'}, ports {port}-{port + PORT_BLOCK - 1}, pushes to {r['target']}")
+    print(f"{name} → workspace {wm.group(0)} ({surface}) in {group or 'no group'}, ports {port}-{port + PORT_BLOCK - 1}, works on {r['target']}")
 
 
 # ---------------------------------------------------------------- cleanup (nothing finished keeps running)
@@ -1181,9 +1221,9 @@ def cmd_end_run(a):
     elif did:
         print(f"cleaned {integ['name']}: {', '.join(did)}")
     git(r["repo"], "branch", "-D", f"{a.run}-integrate", check=False)
-    git(r["repo"], "worktree", "prune", check=False)
-    if r.get("target", "").startswith("orch/"):
-        git(r["repo"], "push", "--quiet", "origin", f":refs/heads/{r['target']}", check=False)
+    feat = Path(r.get("feature") or feature_dir(a.run))
+    with feature_lock(a.run):
+        total += end_feature(a, r, feat)
     if r.get("dash_ws") and have_cmux():
         target, skip, _ = close_target(r["dash_ws"], r.get("dash_id"), f"{a.run} dashboard", cmux_nodes())
         if target:
@@ -1209,6 +1249,47 @@ def cmd_end_run(a):
     if not any_active_run():
         caffeinate_release()
     print(f"{a.run} {a.status}" + (f" — freed ~{total:.0f}MB" if total else ""))
+
+
+def end_feature(a, r, feat):
+    """end-run's part for the feature branch: the feature worktree (and whatever runs in it), then the local and remote
+    orch/<run> — the remote goes only once the local branch or <default> carries everything it has."""
+    total = 0.0
+    if feat.exists():
+        _, total = sweep(paths=(str(feat),))
+        remove_worktree(r["repo"], str(feat))
+        print(f"NOT finished: feature worktree {feat} left — retry with orch end-run --run {a.run}" if feat.exists()
+              else f"cleaned feature worktree {feat}")
+    git(r["repo"], "worktree", "prune", check=False)
+    br = r.get("target", "")
+    if not br.startswith("orch/"):
+        return total
+    if feat.exists():
+        print(f"kept {br} and origin/{br}: the feature worktree is still there")
+        return total
+    root, on = r["repo"], f"refs/remotes/origin/{r['default_branch']}"
+    git_rc(root, "fetch", "--quiet", "origin")
+    shipped = lambda ref: anc(root, ref, on) is True
+    local = git(root, "rev-parse", "-q", "--verify", f"refs/heads/{br}", check=False)
+    remote = git(root, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", check=False)
+    keep_remote = False
+    if remote and not shipped(remote):
+        if not local or anc(root, local, remote):
+            git(root, "branch", "--quiet", "--no-track", "-f", br, remote)  # unshipped work outlives the remote branch
+            local = remote
+        else:
+            rb = r.get("rebased") or {}
+            keep_remote = not (anc(root, remote, local) or (rb.get("from") == remote and rb.get("to")
+                                                              and anc(root, rb["to"], local)))
+    if local and shipped(local):
+        git(root, "branch", "-D", br, check=False)
+    elif local:
+        print(f"kept local branch {br} (not on {r['default_branch']})")
+    if keep_remote:
+        print(f"kept origin/{br}: it has commits neither {br} nor {r['default_branch']} carries")
+    elif remote:
+        git(root, "push", "--quiet", "origin", f":refs/heads/{br}", check=False)
+    return total
 
 
 def cmd_status(a):
@@ -1243,7 +1324,7 @@ def cmd_report(a):
     crit = read_json(d / "criteria.json", [])
     npass = sum(c["status"] == "pass" for c in crit)
     print(f"{r['id']} [{r['status']}] → {r['target']}  criteria {npass}/{len(crit)} passing  ({time.strftime('%H:%M')})")
-    slices = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(".progress.md"))
+    slices = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(NOT_BRIEFS))
     workers = {wk["slice"]: wk for _, wk in workers_of(d, status=None)}
     for sl in slices:
         wk = workers.get(sl)
@@ -1263,13 +1344,88 @@ def cmd_report(a):
 
 
 # ---------------------------------------------------------------- dashboard (live view for the user)
+NOT_BRIEFS = (".progress.md", ".ready.md")  # slices/<id>.md is a brief; these are a worker's progress and evidence
+
+
+def need_no(item, pos):
+    """An item's number: fixed when it was added (clearing an earlier one never renumbers it); older items: position."""
+    return item.get("n", pos)
+
+
+@contextlib.contextmanager
+def state_flock(name, secs=None, busy=""):
+    """An exclusive flock on state/<name> (outside the run dir, whose files count as run activity), released on any
+    exit. secs: give up after that long with exit 1 and `busy` (None: wait as long as it takes)."""
+    f = HOME / "state" / name
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as fh:
+        end = None if secs is None else time.time() + secs
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | (0 if end is None else fcntl.LOCK_NB))
+                break
+            except BlockingIOError:
+                if time.time() >= end:
+                    fail(1, busy)
+                time.sleep(0.2)
+        yield
+
+
 def add_need(d, text):
-    """Add an item to NEEDS YOU (deduplicated by text)."""
-    needs = read_json(d / "waiting.json", [])
-    if not any(n["text"] == text for n in needs):
-        needs.append({"text": text, "since": time.strftime("%H:%M")})
+    """Add an item to NEEDS YOU (deduplicated by text), numbered from a per-run counter that never reuses a number.
+    Returns (needs, the item's number, whether it is new); the read-modify-write is serialised per run."""
+    with state_flock(f"needs-{d.name}.flock"):
+        needs = read_json(d / "waiting.json", [])
+        item = next((x for x in needs if x["text"] == text), None)
+        new = item is None
+        if new:
+            seq, last = HOME / "state" / f"needs-{d.name}.seq", 0
+            for f in (seq, d / "waiting.seq"):  # the run dir's: runs started before the counter moved
+                try:
+                    last = max(last, int(f.read_text()))
+                except (OSError, ValueError):
+                    pass
+            n = max([last, len(needs)] + [x["n"] for x in needs if isinstance(x.get("n"), int)]) + 1
+            seq.write_text(str(n))
+            item = {"n": n, "text": text, "since": time.strftime("%H:%M")}
+            needs.append(item)
+            write_json(d / "waiting.json", needs)
+        return needs, need_no(item, needs.index(item) + 1), new
+
+
+def drop_needs(d, keep):
+    """Remove the NEEDS YOU items for which keep(item, position) is false (serialised like add_need)."""
+    with state_flock(f"needs-{d.name}.flock"):
+        needs = [w for i, w in enumerate(read_json(d / "waiting.json", []), 1) if keep(w, i)]
         write_json(d / "waiting.json", needs)
-    return needs
+        return needs
+
+
+def need_you(d, text):
+    """Add a NEEDS YOU item and, only when it is new, notify the user once (`cmux notify`). The single place orch
+    notifies from (note --wait, merge exit 3). A failed or missing cmux never fails the caller.
+    Returns (needs, the item's number)."""
+    needs, n, new = add_need(d, text)
+    if new:
+        title = (read_json(d / "run.json") or {}).get("title") or d.name
+        cmux("notify", "--title", "Orchestra: needs you", "--subtitle", title, "--body", text)
+    return needs, n
+
+
+def plan_of(d):
+    """(merge_policy, tasks) from plan.json: {"merge_policy": "auto"|"manual", "tasks": [...]}, or a bare list of
+    tasks (= auto; a task is risky only if it says so). No plan → ("auto", [])."""
+    plan = read_json(d / "plan.json", [])
+    if isinstance(plan, dict):
+        tasks = plan.get("tasks")
+        return plan.get("merge_policy", "auto"), [t for t in tasks if isinstance(t, dict)] if isinstance(tasks, list) else []
+    return "auto", [t for t in plan if isinstance(t, dict)] if isinstance(plan, list) else []  # risky: its own flag
+
+
+def valid_plan(plan):
+    if isinstance(plan, dict):
+        plan = plan.get("tasks") if plan.get("merge_policy", "auto") in ("auto", "manual") else None
+    return isinstance(plan, list) and all(isinstance(t, dict) and isinstance(t.get("id"), str) for t in plan)
 
 
 def cmd_note(a):
@@ -1280,11 +1436,14 @@ def cmd_note(a):
     if (read_json(d / "run.json") or {}).get("status") == "active":
         caffeinate_hold()  # the coordinator is back on this run (reap may have released it while idle)
     if a.plan:
-        write_json(d / "plan.json", read_json(Path(a.plan)) or sys.exit(f"orch: bad plan file {a.plan}"))
-    needs = add_need(d, a.wait) if a.wait else read_json(d / "waiting.json", [])
+        plan = read_json(Path(a.plan))
+        if not valid_plan(plan):
+            sys.exit(f"orch: bad plan file {a.plan}: want {{\"merge_policy\": \"auto\"|\"manual\", \"tasks\": "
+                     f"[{{\"id\", \"title\", \"wave\", \"depends\", \"criteria\", \"goal\", \"risky\"}}]}} or a bare task list")
+        write_json(d / "plan.json", plan)
+    needs = need_you(d, a.wait)[0] if a.wait else read_json(d / "waiting.json", [])
     if a.done:
-        needs = [] if a.done == "all" else [w for i, w in enumerate(needs, 1) if str(i) != a.done]
-        write_json(d / "waiting.json", needs)
+        needs = drop_needs(d, lambda w, i: a.done != "all" and str(need_no(w, i)) != a.done)
     if a.next_tick:
         hh, mm = map(int, a.next_tick.split(":"))
         t = time.localtime()
@@ -1293,13 +1452,14 @@ def cmd_note(a):
     if a.finish is not None:
         write_json(d / "finish.json", {"step": a.finish, "at": time.strftime("%H:%M")})
     for i, w in enumerate(needs, 1):
-        print(f"  {i}. [{w['since']}] {w['text']}")
+        print(f"  {need_no(w, i)}. [{w['since']}] {w['text']}")
 
 
-WORKER_STEPS = [(1, "setup + sync"), (2, "implement (tests red → green)"), (3, "gates"), (4, "review + verify"),
-                (5, "fix loop (if review/verify fails)"), (6, "rebase + push to run branch")]
-FINISH_STEPS = ["integration worktree + rebase on main", "all checks + secrets scan",
-                "final review + adversarial + verify (all criteria)", "push to main", "end run + clean up"]
+WORKER_STEPS = [(1, "setup + rebase on the feature branch"), (2, "do the task (tests first)"), (3, "gates"),
+                (4, "review loop"), (5, "re-check the feature branch"), (6, "prove the criteria"),
+                (7, "evidence + READY")]
+FINISH_STEPS = ["final review", "final tests", "CI on branch head", "ship to main", "CI on main"]
+FINISH_WAIT = {1: "final reviewer", 2: "verifier: every criterion", 3: "CI on the feature branch", 5: "CI on main"}
 
 
 def _dash_frame(run):
@@ -1322,11 +1482,11 @@ def _dash_frame(run):
 
     live = cmux_live_workspaces()
     workers = {wk["slice"]: wk for _, wk in workers_of(d, status=None) if wk["slice"] != "integrate"}
-    plan = read_json(d / "plan.json", [])
+    policy, plan = plan_of(d)
     meta = {x["id"]: x for x in plan}
-    briefed = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(".progress.md"))
+    briefed = sorted(p.stem for p in (d / "slices").glob("*.md") if not p.name.endswith(NOT_BRIEFS))
     order = list(dict.fromkeys([x["id"] for x in plan] + briefed + list(workers)))
-    merged = {sl for sl, wk in workers.items() if wk["status"] in ("done", "merged")}
+    merged = {sl for sl, wk in workers.items() if wk.get("merged") or wk["status"] == "merged"}  # as ship counts
     fin = read_json(d / "finish.json", {}).get("step", 0)  # 0 = not started, 1..5 = current step, 6 = finished
     if status != "active":
         fin = 6
@@ -1340,7 +1500,8 @@ def _dash_frame(run):
         lines = [x for x in prog.read_text().splitlines() if x.strip() and not x.startswith("#")] if prog.exists() else []
         age = int((time.time() - prog.stat().st_mtime) // 60) if prog.exists() else None
         if sl in merged:
-            sha = next((mm.group(1) for ln in reversed(lines) for mm in [re.search(r"\b([0-9a-f]{7,12})\b", ln)] if mm), "")
+            sha = (wk.get("sha") or "") or next((mm.group(1) for ln in reversed(lines)
+                                                  for mm in [re.search(r"\b([0-9a-f]{7,12})\b", ln)] if mm), "")
             when = (lines[-1][:5] if lines else "")
             done.append(f"  {G}✓{X} {name:24} {sha[:7]:8} {DIM}{when}{X}")
             continue
@@ -1356,7 +1517,9 @@ def _dash_frame(run):
             for ln in lines[-2:]:
                 working.append(f"      {DIM}{ln[:W - 8]}{X}")
             if step == 4:
-                waiting.append(f"  {name:22} review + verify  {DIM}← its reviewer + verifier{X}".ljust(W - 8) + tag("worker"))
+                waiting.append(f"  {name:22} review loop  {DIM}← its reviewer + /code-review{X}".ljust(W - 8) + tag("worker"))
+            elif step == 7:
+                waiting.append(f"  {name:22} READY  {DIM}← merge{X}".ljust(W - 8) + tag("coord"))
             for n, lab in WORKER_STEPS:
                 if n >= max(step, 1):
                     pending.append((f"{sl}  {lab}", "worker", n == step))
@@ -1367,15 +1530,15 @@ def _dash_frame(run):
             else:
                 waiting.append(f"  {name:22} {DIM}← dispatch (≤3 workers at once){X}".ljust(W - 8) + tag("coord"))
             goal = f": {m['goal']}" if m.get("goal") else ""
-            pending.append((f"{sl}  {m.get('title', '')}{goal} — all 6 steps", "worker", False))
+            pending.append((f"{sl}  {m.get('title', '')}{goal} — all {len(WORKER_STEPS)} steps", "worker", False))
     slices_left = [sl for sl in order if sl not in merged]
     if fin < 6:
         if fin == 0:
             waiting.append(f"  {'run finish':22} {DIM}← {', '.join(slices_left) or 'coordinator'}{X}".ljust(W - 8) + tag("coord"))
         else:
             working.append(f"  {G}●{X} {'run finish':22} {FINISH_STEPS[fin - 1]}".ljust(W - 8) + tag("coord"))
-            if fin == 3:
-                waiting.append(f"  {'run finish':22} {DIM}← final reviewers + verifier{X}".ljust(W - 8) + tag("coord"))
+            if fin in FINISH_WAIT:
+                waiting.append(f"  {'run finish':22} {DIM}← {FINISH_WAIT[fin]}{X}".ljust(W - 8) + tag("coord"))
         for i, lab in enumerate(FINISH_STEPS, 1):
             if i >= max(fin, 1):
                 pending.append((f"run {lab}", "coord", i == fin))
@@ -1385,9 +1548,9 @@ def _dash_frame(run):
 
     out = [f"{B}{Path(r.get('repo', '?')).name}{X} · {r.get('title', run)}  {DIM}{run} [{status}]{X}  "
            f"{time.strftime('%H:%M:%S')}   next tick {C}{tick}{X}",
-           f"Criteria {npass}/{len(crit)} {G}{bar}{X}", ""]
+           f"Criteria {npass}/{len(crit)} {G}{bar}{X}   merge policy {policy}", ""]
     out.append(f"{B}{Y}NEEDS YOU ({len(needs)}){X}" if needs else f"{B}NEEDS YOU{X} {DIM}nothing{X}")
-    out += [f"  {Y}!{X} {i}. {n['text'][:W - 20]} {DIM}since {n['since']}{X}" for i, n in enumerate(needs, 1)]
+    out += [f"  {Y}!{X} {need_no(n, i)}. {n['text'][:W - 20]} {DIM}since {n['since']}{X}" for i, n in enumerate(needs, 1)]
     out += ["", f"{B}WAITING ({len(waiting)}){X}"] + (waiting or [f"  {DIM}nothing blocked{X}"])
     out += ["", f"{B}WORKING ({sum(not w.startswith('      ') for w in working)}){X}"] + (working or [f"  {DIM}idle{X}"])
     out += ["", f"{B}PENDING ({len(pending)}){X}"]
@@ -1467,10 +1630,13 @@ def cmd_register(a):
         if own:
             sys.exit(f"orch: --sync refused: worktree has {len(own.split())} commit(s) of its own (resume instead)")
         git(wt, "reset", "--quiet", "--hard", f"origin/{target}")
+    # the guard lets a worker message only these: the run's ref, and its stable cmux id (new-run's; never resolved
+    # here: a surface:N may be reused by another chat by now)
+    coord, coord_id = r.get("coordinator"), r.get("coordinator_id")  # recorded once, by new-run
     write_json(git_dir(wt) / "orchestra-owner.json", {
         "owner": f"{a.run}-{a.slice}", "run": a.run, "slice": a.slice, "target": target,
-        "workspace": cmux_workspace(), "at": now()})
-    print(f"registered {a.run}-{a.slice} → pushes to {target}")
+        "coordinator": coord, "coordinator_id": coord_id, "workspace": cmux_workspace(), "at": now()})
+    print(f"registered {a.run}-{a.slice} → works on {target}")
 
 
 @contextlib.contextmanager
@@ -1519,7 +1685,7 @@ def steal_lock(d, seen):
     return False
 
 
-GC_KEEP = ("spec.md", "HANDOFF.md", "criteria.json", "plan.json", "run.json")
+GC_KEEP = ("spec.md", "HANDOFF.md", "criteria.json", "plan.json", "run.json", "feature")
 
 
 def du(p):
@@ -1578,21 +1744,241 @@ def cmd_gc(a):
     print(f"{'would free' if a.dry_run else 'freed'} {human(total)} from {len(lines)} ended run(s)")
 
 
+def add_event(slug, **ev):
+    EVENTS.mkdir(parents=True, exist_ok=True)
+    with open(EVENTS / f"{slug}.jsonl", "a") as f:
+        f.write(json.dumps({"at": now(), **ev}) + "\n")
+
+
+def record_merged(slug, run_id, sl, sha, branch, summary="", create=False):
+    """A task's work is on its branch: the event, and its worker record marked merged (ship reads `merged`)."""
+    add_event(slug, event="merged", by=f"{run_id}-{sl}", branch=branch, sha=sha, summary=summary)
+    w = RUNS / run_id / "workers" / f"{sl}.json"
+    wk = read_json(w) or ({"run": run_id, "slice": sl, "name": f"{run_id}-{sl}", "target": branch} if create else None)
+    if wk:
+        wk.update(status="merged", sha=sha, merged=now())
+        write_json(w, wk)
+
+
+def git_rc(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def fail(code, msg):
+    sys.stderr.write(f"orch: {msg}\n")
+    sys.exit(code)
+
+
+def anc(cwd, a, b):
+    """a is an ancestor of (or is) b: True/False; None when git can't tell (a missing object or ref)."""
+    rc = git_rc(cwd, "merge-base", "--is-ancestor", a, b).returncode
+    return {0: True, 1: False}.get(rc)
+
+
+def anc_or_fail(cwd, a, b):
+    x = anc(cwd, a, b)
+    if x is None:
+        fail(1, f"git can't compare {a[:12]} with {b[:12]} in {cwd} — nothing done")
+    return x
+
+
+def carries(cwd, ob, head, rb):
+    """head carries all of origin/orch/<run> (ob): ob is in it, or ob is what ship's own exit-4 rebase started from
+    (rb = run.json "rebased") and that rebased head is in it."""
+    return not ob or anc_or_fail(cwd, ob, head) or bool(
+        rb.get("from") == ob and rb.get("to") and anc_or_fail(cwd, rb["to"], head))
+
+
+def feature_lock(run):
+    """The per-run flock merge, ship, run-branch and end-run's feature teardown take turns on (bounded wait)."""
+    try:
+        secs = float(os.environ.get("ORCH_FEATURE_LOCK_SECS") or 300)
+    except ValueError:
+        fail(1, f"ORCH_FEATURE_LOCK_SECS must be a number of seconds (got {os.environ['ORCH_FEATURE_LOCK_SECS']!r})")
+    return state_flock(f"feature-{run}.flock", secs, f"another orch merge/ship/run-branch/end-run of {run} is still "
+                       f"running after {secs:.0f}s — nothing done here; run it again once that one has finished")
+
+
+def on_feature(fn):
+    """merge and ship: never from a worker's checkout, and one at a time per run — two READYs merged in parallel tool
+    calls share the feature worktree, and one could reset the other's fast-forward away. The flock is held only while
+    the command runs (released on any exit); a second one waits up to ORCH_FEATURE_LOCK_SECS (default 300), then
+    exits 1."""
+    def wrapped(a):
+        gd = git(os.getcwd(), "rev-parse", "--path-format=absolute", "--git-dir", check=False)
+        if gd and (Path(gd) / "orchestra-owner.json").exists():
+            fail(1, "workers never merge or ship: send READY to your coordinator")
+        if not (RUNS / a.run / "run.json").exists():
+            fail(1, f"no run {a.run}")
+        with feature_lock(a.run):
+            fn(a)
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+def feature_of(a):
+    """(run dir, run.json, feature branch, feature worktree) for merge/ship, which work only in a clean feature worktree
+    on orch/<run> (exit 1 otherwise, nothing done)."""
+    d = RUNS / a.run
+    r = read_json(d / "run.json") or fail(1, f"no run {a.run}")
+    br, feat = f"orch/{a.run}", Path(r.get("feature") or feature_dir(a.run))
+    if r.get("target") != br or not feat.is_dir():
+        fail(1, f"no feature branch for {a.run}: run `orch run-branch --run {a.run}` first")
+    if git(feat, "symbolic-ref", "-q", "--short", "HEAD", check=False) != br:
+        fail(1, f"{feat} isn't on {br} (a rebase or checkout in progress?) — nothing done")
+    if git(feat, "status", "--porcelain", "--untracked-files=no"):
+        fail(1, f"{feat} has uncommitted changes to tracked files — `git restore --staged --worktree .` there; nothing done")
+    if git_rc(feat, "fetch", "--quiet", "origin").returncode:
+        fail(1, "git fetch origin failed — nothing done")
+    return d, r, br, feat
+
+
+def worker_head(r, sl):
+    """The worker's branch head: its worktree's HEAD, else its branch worktree-<run>-<slice> (the worktree is gone)."""
+    name = f"{r['id']}-{sl}"
+    wt = Path(r["repo"]) / ".claude" / "worktrees" / name
+    if (wt / ".git").exists():
+        return git(wt, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False)
+    return git(r["repo"], "rev-parse", "-q", "--verify", f"refs/heads/worktree-{name}^{{commit}}", check=False)
+
+
+def ok_item(sl, head):
+    """The NEEDS YOU item merge exit 3 opens for this task at this sha (what --user-ok must match)."""
+    return lambda w: w["text"].startswith(f"OK to merge {sl} ") and f" at {head} into " in w["text"]
+
+
+@on_feature
+def cmd_merge(a):
+    """Fast-forward orch/<run> to a READY task's head and push it. Exit 0 merged; 2 not a fast-forward (REBASE);
+    3 needs the user's OK (risky task, merge_policy manual, or a task not in plan.json; no --user-ok, or no open NEEDS
+    YOU item for this sha: adds it + notifies); 4 evidence missing/stale or the sha doesn't match.
+    Any non-zero exit: nothing changed."""
+    sl, want = a.slice, a.sha.lower()
+    d, r, br, feat = feature_of(a)
+    ev = d / "slices" / f"{sl}.ready.md"
+    try:
+        first = ev.read_text().split("\n", 1)[0]
+    except OSError:
+        fail(4, f"no evidence file {ev} — the worker writes it before READY")
+    m = re.fullmatch(r"sha:\s*([0-9a-f]{40})\s*", first)
+    if not m:
+        fail(4, f"{ev}: line 1 must be `sha: <full sha>` (got {first[:60]!r})")
+    head = worker_head(r, sl)
+    if not head:
+        fail(4, f"no worker branch for {sl} (worktree-{r['id']}-{sl})")
+    if not re.fullmatch(r"[0-9a-f]{7,40}", want) or not head.startswith(want):
+        fail(4, f"--sha {a.sha} isn't {sl}'s branch head {head}")
+    if m.group(1) != head:
+        fail(4, f"stale evidence: {ev} names {m.group(1)[:12]}, {sl}'s branch head is {head[:12]} — FIX: redo the evidence")
+    old = git(feat, "rev-parse", "HEAD")
+    upstream = git(feat, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", check=False)
+    if upstream != old:
+        fail(1, f"{br} in {feat} ({old[:12]}) is behind origin/{br} ({upstream[:12]}): `orch run-branch --run {a.run}` "
+                f"catches it up; nothing done" if upstream and anc(feat, old, upstream) else
+                f"{br} in {feat} ({old[:12]}) isn't origin/{br} ({(upstream or 'gone')[:12]}) — after a ship rebase "
+                f"nothing merges into it; nothing done")
+    if not anc_or_fail(feat, old, head):
+        fail(2, f"REBASE: {sl} at {head[:12]} isn't a fast-forward of {br} ({old[:12]}) — the worker rebases onto origin/{br}")
+    if (d / "plan.json").exists() and not valid_plan(read_json(d / "plan.json")):
+        fail(1, f"{d / 'plan.json'} is unreadable or malformed — fix it with orch note --plan; nothing done")
+    policy, tasks = plan_of(d)
+    task = next((t for t in tasks if t.get("id") == sl), None)
+    why = ("not in plan.json" if task is None else "risky task" if task.get("risky")
+           else None if policy == "auto" else f"merge policy {policy}")
+    task = task or {}
+    asked = any(map(ok_item(sl, head), read_json(d / "waiting.json", [])))
+    if why and not (a.user_ok and asked):  # an OK counts only for the sha the user was shown (its open item)
+        title = f" {task['title']}" if task.get("title") else ""
+        _, n = need_you(d, f"OK to merge {sl}{title} at {head} into {br}? ({why}; evidence {ev})")
+        print(n)
+        fail(3, (f"--user-ok, but the user wasn't asked about {head[:12]} (the sha changed?): " if a.user_ok else "")
+             + f"{sl} needs the user's OK ({why}): NEEDS YOU item {n}; once OK'd: "
+             f"orch merge --run {a.run} --slice {sl} --sha {head} --user-ok (it clears the item)")
+    res = git_rc(feat, "merge", "--ff-only", "--quiet", head)
+    if res.returncode:  # git refused before moving anything
+        fail(1, f"fast-forward in {feat} failed — nothing done: {(res.stderr or res.stdout).strip()}")
+    res = git_rc(feat, "push", "--quiet", "origin", f"{head}:refs/heads/{br}")  # the sha checked, not a ref
+    if res.returncode:
+        told = not git_rc(feat, "fetch", "--quiet", "origin").returncode
+        if not told or git(feat, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", check=False) != head:
+            git_rc(feat, "reset", "--quiet", "--hard", old)  # it was clean on `old`: this restores it exactly
+            fail(1, f"push of {br} refused — nothing done: {(res.stderr or res.stdout).strip()}" if told else
+                    f"push of {br} failed and origin can't be read to tell whether it landed: feature worktree put "
+                    f"back, not marked merged; if origin has {head[:12]}, `orch run-branch --run {a.run}` catches up")
+        # it did land (the error came after): the merge stands
+    freed = unlock(r["repo"], f"{a.run}-{sl}")
+    record_merged(r["repo_slug"], a.run, sl, head, br, create=True)
+    # every open OK question about this task goes: the merged sha's, and older shas' the worker moved on from
+    drop_needs(d, lambda w, i: not (w["text"].startswith(f"OK to merge {sl} ") and f" into {br}? " in w["text"]))
+    print(f"merged {sl} {head[:12]} into {br} (pushed; {freed} file lock(s) released)")
+
+
+@on_feature
+def cmd_ship(a):
+    """Fast-forward <default> to the feature branch. Exit 0 shipped (prints the sha); 2 a plan task isn't merged;
+    3 <default> moved and conflicts (rebase aborted, nothing pushed); 4 <default> moved and the feature worktree was
+    rebased onto it cleanly (nothing pushed: re-run the final tests on it, then ship again). Never forced."""
+    d, r, br, feat = feature_of(a)
+    _, tasks = plan_of(d)
+    if not tasks:
+        fail(2, f"no plan tasks in {d / 'plan.json'} — nothing to ship")
+    workers = {wk["slice"]: wk for _, wk in workers_of(d, status=None)}
+    left = [str(t.get("id")) for t in tasks if not (workers.get(t.get("id")) or {}).get("merged")]
+    if left:
+        fail(2, f"not merged yet: {', '.join(left)} — nothing done")
+    b = r["default_branch"]
+    base = git(feat, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{b}", check=False) or fail(1, f"no origin/{b}")
+    head = git(feat, "rev-parse", "HEAD")
+    ob = git(feat, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", check=False)
+    rb = r.get("rebased") or {}
+    if not carries(feat, ob, head, rb):
+        # origin/orch/<run> holds something this head neither contains nor was rebased from: shipping (and deleting
+        # it) would lose it — before a rebase too, or the rebase record would vouch for it
+        lost = git(feat, "log", "--format=%h %s", f"{head}..{ob}").splitlines()
+        fail(1, f"origin/{br} has commits {head[:12]} doesn't carry ({'; '.join(lost[:5])}) — nothing pushed")
+    if not anc_or_fail(feat, base, head):
+        res = git_rc(feat, "rebase", "--quiet", "--rebase-merges", base)  # a conflict-fix merge commit stays one
+        if res.returncode:
+            files = git(feat, "diff", "--name-only", "--diff-filter=U", check=False).split()
+            if Path(git(feat, "rev-parse", "--path-format=absolute", "--git-path", "rebase-merge")).exists():
+                git_rc(feat, "rebase", "--abort")
+            if git(feat, "rev-parse", "HEAD") != head or git(feat, "symbolic-ref", "-q", "--short", "HEAD", check=False) != br:
+                git_rc(feat, "checkout", "--quiet", br)  # never leave it detached
+            if not files:  # not a conflict (e.g. an untracked file in the way): say what git said
+                fail(1, f"rebase onto origin/{b} failed — nothing pushed: {(res.stderr or res.stdout).strip()}")
+            fail(3, f"origin/{b} conflicts with {br}: {', '.join(files)} — rebase aborted, nothing pushed")
+        new = git(feat, "rev-parse", "HEAD")
+        # origin/orch/<run> can't take the rebased head without a forced update: the next ship accepts that
+        # origin/orch/<run> (unchanged since, and carried by the head just rebased) as carried by this one
+        r = read_json(d / "run.json") or r
+        r["rebased"] = {"from": ob or None, "to": new}
+        write_json(d / "run.json", r)
+        print(f"rebased to {new}; re-run the final tests, then ship again")
+        sys.exit(4)
+    res = git_rc(feat, "push", "--quiet", "origin", f"{head}:refs/heads/{b}")
+    if res.returncode:
+        fail(1, f"push to {b} refused (did origin/{b} move? ship again) — nothing pushed: {(res.stderr or res.stdout).strip()}")
+    gone = git_rc(feat, "push", "--quiet", "origin", f":refs/heads/{br}")
+    if gone.returncode:
+        print(f"orch: shipped, but deleting origin/{br} failed: {(gone.stderr or gone.stdout).strip()}", file=sys.stderr)
+    r = read_json(d / "run.json") or r
+    r["shipped"] = head
+    write_json(d / "run.json", r)
+    add_event(r["repo_slug"], event="shipped", by=a.run, branch=b, sha=head)
+    print(head)
+
+
 def cmd_merged(a):
+    """Record a merge made outside `orch merge`, and tell other runs' coordinators whose workers target that branch."""
     o = owner_info(a.repo) or {}
     run_id, sl = a.run or o.get("run"), a.slice or o.get("slice")
     if not run_id or not sl:
         sys.exit("orch: merged needs --run/--slice (or a registered worktree)")
+    if not (RUNS / run_id / "run.json").exists():
+        sys.exit(f"orch: no run {run_id}")
     slug, me = slug_of(a.repo), f"{run_id}-{sl}"
     branch = a.branch or o.get("target") or default_branch(a.repo)
-    EVENTS.mkdir(parents=True, exist_ok=True)
-    with open(EVENTS / f"{slug}.jsonl", "a") as f:
-        f.write(json.dumps({"at": now(), "event": "merged", "by": me, "branch": branch, "sha": a.sha, "summary": a.summary}) + "\n")
-    w = RUNS / run_id / "workers" / f"{sl}.json"
-    wk = read_json(w)
-    if wk:
-        wk.update(status="merged", sha=a.sha, merged=now())
-        write_json(w, wk)
+    record_merged(slug, run_id, sl, a.sha, branch, a.summary, create=True)
     # Workers never message other workers: only coordinators are told; each relays to its own workers.
     told, failed = [], []
     for d, r in runs_for(slug):
@@ -1600,9 +1986,9 @@ def cmd_merged(a):
             continue  # own coordinator learns from the worker's MERGED report
         waiting = [wk["name"] for _, wk in workers_of(d) if wk["name"] != me and wk.get("target") == branch]
         text = (f"MOVED: {me} pushed {a.sha[:10]} to origin/{branch} ({a.summary}). "
-                + (f"Your workers pushing to {branch}: {', '.join(waiting)} — relay: "
+                + (f"Your workers on {branch}: {', '.join(waiting)} — relay: "
                    f"orch broadcast --run {r['id']} --branch {branch} \"REBASE: ...\"" if waiting
-                   else f"None of your workers push to {branch}; note it for integration."))
+                   else f"None of your workers work on {branch}; note it before you ship."))
         c = r.get("coordinator")
         if c:
             (told if cmux_message(c, text, me) else failed).append(f"coordinator of {r['id']}")
@@ -1618,6 +2004,8 @@ def main():
     c = s.add_parser("spawn"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--resume", action="store_true"); c.add_argument("--all-mcp", action="store_true", help="give the worker every MCP server"); c.add_argument("--dry-run", action="store_true", help="print what it would run; call neither cmux nor claude")
     c = s.add_parser("close"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--status", default="done")
     c = s.add_parser("run-branch"); c.add_argument("--run", required=True)
+    c = s.add_parser("merge"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--sha", required=True, help="the sha in READY: must be the worker's branch head and the evidence's line 1"); c.add_argument("--user-ok", action="store_true", help="the user OK'd this sha (risky task / manual policy)")
+    c = s.add_parser("ship"); c.add_argument("--run", required=True)
     c = s.add_parser("baseline"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("--setup", help="e.g. 'npm ci'"); c.add_argument("--cmd", action="append", required=True)
     c = s.add_parser("add-worker"); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--workspace", required=True)
     for n in ("lock", "unlock"):
@@ -1634,7 +2022,7 @@ def main():
     c = s.add_parser("status"); c.add_argument("--run"); c.add_argument("--all", action="store_true")
     c = s.add_parser("broadcast"); c.add_argument("--run", required=True); c.add_argument("--branch"); c.add_argument("text")
     c = s.add_parser("dash"); c.add_argument("--run", required=True); c.add_argument("--every", type=float, default=2); c.add_argument("--once", action="store_true"); c.add_argument("--open", action="store_true", help="open it as a workspace in the run's group")
-    c = s.add_parser("note"); c.add_argument("--run", required=True); c.add_argument("--plan", help="JSON [{id,title,wave,depends}]"); c.add_argument("--wait", help="add an item waiting on the user"); c.add_argument("--done", help="clear waiting item N, or 'all'"); c.add_argument("--next-tick", help="HH:MM of the next cron tick"); c.add_argument("--finish", type=int, choices=range(0, 7), help="run-finish step the coordinator is on (0 not started … 6 done)")
+    c = s.add_parser("note"); c.add_argument("--run", required=True); c.add_argument("--plan", help='JSON {"merge_policy": "auto"|"manual", "tasks": [{id,title,wave,depends,criteria,goal,risky}]} (or a bare task list)'); c.add_argument("--wait", help="add an item waiting on the user"); c.add_argument("--done", help="clear waiting item N, or 'all'"); c.add_argument("--next-tick", help="HH:MM of the next cron tick"); c.add_argument("--finish", type=int, choices=range(0, 7), help="run-finish step the coordinator is on (0 not started … 6 done)")
     c = s.add_parser("report"); c.add_argument("--run", required=True); c.add_argument("--stall", type=int, default=15, help="minutes without progress = STALLED")
     c = s.add_parser("register"); c.add_argument("--worktree", default="."); c.add_argument("--run", required=True); c.add_argument("--slice", required=True); c.add_argument("--target"); c.add_argument("--sync", action="store_true", help="fresh worktree: reset to origin/<target>")
     c = s.add_parser("gc"); c.add_argument("--ended-older-than", default="14d", help="<N>d (default 14d)"); c.add_argument("--dry-run", action="store_true", help="list what would go, with sizes")

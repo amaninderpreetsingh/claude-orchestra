@@ -20,8 +20,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 #   test-watch.sh         orch-watch --timeout/--interval: elapsed time must fall in [2,6]s / ≤ 6s
 #   test-orch-reap-timing.sh  close/reap read the argv/cwd of helpers given a 0.3s head start, and wait on
 #                         listeners with 6s up/down polls (test-orch-reap.sh keeps the non-timing checks)
+#   test-guard.sh         a hung or slow guard must answer within seconds: elapsed time ≤ 10s / ≤ 15s (its hook timeout is 60s)
 # Only suites that were found or named are matched against this list, so a name here without a file is harmless.
-SOLO=" test-watch.sh test-orch-reap-timing.sh "
+SOLO=" test-watch.sh test-orch-reap-timing.sh test-guard.sh "
 JOBS=${ORCH_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 case "$JOBS" in ''|*[!0-9]*|0) echo "run.sh: ORCH_TEST_JOBS must be a positive integer (got '$JOBS')"; exit 1 ;; esac
 if [ $# -gt 0 ]; then

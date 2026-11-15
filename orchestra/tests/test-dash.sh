@@ -32,16 +32,43 @@ out=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g')
 ok "five sections in order" '[ "$(echo "$out" | grep -oE "^(NEEDS YOU|WAITING|WORKING|PENDING|DONE)" | tr "\n" " ")" = "NEEDS YOU WAITING WORKING PENDING DONE " ]'
 ok "needs-you deduplicated" 'echo "$out" | grep -q "NEEDS YOU (1)"'
 ok "S3 waits for S2" 'echo "$out" | grep -E "S3 fixes.*← S2 merged" -q'
-ok "S2 waits on its reviewers" 'echo "$out" | grep -q "← its reviewer + verifier"'
-ok "S2 working at step 4" 'echo "$out" | grep -E "S2 tasks +step 4 review" -q'
-ok "pending marks current step" 'echo "$out" | grep -E "S2  review \+ verify.*● now" -q'
-ok "pending lists queued slice with goal" 'echo "$out" | grep -q "S3  fixes: keep valid tasks — all 6 steps"'
-ok "pending lists run finish" 'echo "$out" | grep -q "run push to main"'
+ok "S2 waits on its reviewers" 'echo "$out" | grep -q "← its reviewer + /code-review"'
+ok "S2 working at step 4" 'echo "$out" | grep -E "S2 tasks +step 4 review loop" -q'
+ok "pending marks current step" 'echo "$out" | grep -E "S2  review loop.*● now" -q'
+ok "pending lists queued slice with goal" 'echo "$out" | grep -q "S3  fixes: keep valid tasks — all 7 steps"'
+ok "worker steps end at evidence + READY (workers never push)" 'echo "$out" | grep -q "S2  evidence + READY" && ! echo "$out" | grep -qi "push to run branch"'
+ok "bare-list plan reads as merge policy auto" 'echo "$out" | grep -q "merge policy auto"'
+ok "pending lists the five finish steps in order" '[ "$(echo "$out" | sed -nE "s/^ +[0-9]+\. run (.*[^ ]) +coord.*/\1/p" | tr "\n" "|")" = "final review|final tests|CI on branch head|ship to main|CI on main|" ]'
+ok "no integration-panel or native wording" '! echo "$out" | grep -qiE "integration|native|maestro|simulator"'
 ok "done shows S1 with sha" 'echo "$out" | grep -E "✓ S1 scaffold +abc1234" -q'
 $O note --run $RUN --finish 3 >/dev/null
 out=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g')
-ok "finish step shows as working" 'echo "$out" | grep -E "run finish +final review" -q'
-ok "earlier finish steps done" 'echo "$out" | grep -q "✓ run all checks"'
+ok "finish step 3 shows as working" 'echo "$out" | grep -E "run finish +CI on branch head" -q'
+ok "  …waiting on CI" 'echo "$out" | grep -q "← CI on the feature branch"'
+ok "earlier finish steps done" 'echo "$out" | grep -q "✓ run final review" && echo "$out" | grep -q "✓ run final tests" && ! echo "$out" | grep -q "✓ run CI on branch head"'
+$O note --run $RUN --finish 1 >/dev/null
+out=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g')
+ok "finish step 1 = final review, waiting on the final reviewer" 'echo "$out" | grep -E "run finish +final review" -q && echo "$out" | grep -q "← final reviewer"'
+
+# the object plan shape: merge policy shown, tasks read from "tasks" (a worker at step 7 waits on the merge)
+cat > $S/plan2.json <<'EOF'
+{"merge_policy":"manual","tasks":[{"id":"S1","title":"scaffold","wave":1,"depends":[],"criteria":["C1"],"goal":"g","risky":false},
+ {"id":"S2","title":"tasks","wave":2,"depends":["S1"],"criteria":[],"goal":"g","risky":true},
+ {"id":"S3","title":"fixes","wave":3,"depends":["S2"],"criteria":[],"goal":"keep valid tasks","risky":false}]}
+EOF
+$O note --run $RUN --plan $S/plan2.json >/dev/null
+printf '23:10 step 7 READY sent\n' >> $D/slices/S2.progress.md
+out=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g')
+ok "object plan: merge policy manual shown" 'echo "$out" | grep -q "merge policy manual"'
+ok "object plan: tasks, deps and goals read" 'echo "$out" | grep -E "S3 fixes.*← S2 merged" -q && echo "$out" | grep -q "S3  fixes: keep valid tasks — all 7 steps"'
+ok "object plan: S2 at step 7 waits on the merge" 'echo "$out" | grep -E "S2 tasks +READY +← merge" -q'
+printf 'sha: %040d\n' 0 > $D/slices/S2.ready.md   # the worker's evidence file is not a brief
+out=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g'); rep=$($O report --run $RUN 2>&1)
+ok "an evidence file (slices/<id>.ready.md) is no task on the dashboard or the report" '! echo "$out" | grep -q "S2.ready" && ! echo "$rep" | grep -q "S2.ready" && echo "$rep" | grep -q "S2 "'
+echo '{"merge_policy":"sometimes","tasks":[]}' > $S/bad.json
+ok "note --plan refuses an unknown merge policy" '! $O note --run $RUN --plan $S/bad.json >/dev/null 2>&1 && grep -q manual $D/plan.json'
+echo '{"tasks":[{"title":"no id"}]}' > $S/bad.json
+ok "note --plan refuses a task without an id" '! $O note --run $RUN --plan $S/bad.json >/dev/null 2>&1'
 python3 -c "import json,time;json.dump({'next':time.time()-600},open('$D/ticks.json','w'))"   # last tick 10 min ago
 m=$($O dash --run $RUN --once | sed 's/\x1b\[[0-9;]*m//g' | sed -nE 's/.*next tick [0-9:]+ \(([0-9]+)m.*/\1/p')
 ok "next tick projected on the 30-min heartbeat" '[ "${m:-0}" -ge 15 ] && [ "$m" -le 20 ]'
