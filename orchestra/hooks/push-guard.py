@@ -22,10 +22,12 @@ Pushes are parsed like the shell would (backslash-newline joined, quotes removed
 read, `&>`/`>&`/`>|` kept as redirections); a push it can't parse exactly (unbalanced quotes, $ ` { * ? [ expansion)
 is denied in a worker or under a tier record and gets no decision elsewhere; a force flag or +/: refspec in any brace
 alternative is denied outright. The guard never asks: unattended runs can't answer a prompt.
-Every `git … push` in the text is a push, except inside a data string (see data_strings: grep -rn "git push" .).
+Every `git … push` in the text is a push, except inside a data string (see data_strings: grep -rn "git push" .) or a
+heredoc body only read (doc_is_data: cat/tee/git, never inside $( … ) / backticks / <( … ), whose output runs); the
+same text under a runner (bash -c, sh, eval, $( … ), | sh) is still a push.
 "Inside a worker" is the session's cwd; a worker push command with cd/pushd, or -C elsewhere, is denied.
 Threat model for the parser: accidental shortcuts, not a hostile agent — chasing every shell obfuscation is unbounded.
-Known limits: data run later (echo "…" > f; ./f), python -c subprocesses.
+Known limits: data run later (echo "…" > f; ./f), python -c subprocesses given an argument list.
 Where a push runs is followed through ; && || newline, { } / if bodies, ( … ) / $( … ) scopes, quoted dirs, cd -- and
 pushd/popd (cwd_at); a cd it can't resolve ($X, -, a glob, a missing dir, one inside quotes such as bash -c "cd x && …")
 makes the checkout unknown: denied in a worker, or when any checkout it may run in is a worker or has a tier record.
@@ -33,14 +35,18 @@ So does a cd that may not run: inside an if/while/until/for/select/case or funct
 once that && chain ends (false && cd x; git push). A cd inside cmux-typed text (cmux send "cd <worktree> && …") adds
 only non-worker candidates: it binds tier records, not the coordinator's worker instructions.
 So inside a worker, any command that mentions push AND uses shell indirection ($'…', $VAR, ${…}, $(…), backticks,
-{a,b}, eval, xargs, sh/bash -c, alias), or any git push written with a quote/backslash, is denied: write it plainly. Outside workers obfuscation (a quoted or
-escaped verb such as git 'push', a shell-built one, args fed by xargs) is out of scope.
+{a,b}, eval, xargs, sh/bash -c, alias), or any git push written with a quote/backslash, is denied: write it plainly.
+A push named only in data (a data string or a body only read) pairs only with live indirection: a plain $VAR given
+to a reader (echo "… push …" >> $PROG, cat >> $F <<EOF) doesn't count (live_indirection). Outside workers
+obfuscation (a quoted or escaped verb such as git 'push', a shell-built one, args fed by xargs) is out of scope.
 Inside a worker a compound command holding a push (chained, piped, backgrounded, a subshell or $( … ), a heredoc fed
 to anything but cat/git/tee) is denied, and so is any push that isn't the one allowed form above (an allow would
 approve the whole command; a prompt would stall the unattended worker): push with one plain command.
-Every cmux command a worker runs is checked (each ; && || | & newline segment), and every `orch verdict|criterion`
-call with every --role; text only a reader program reads (READERS: a cat/git heredoc, echo/printf/grep/…, a commit
-message, orch --summary, a cmux report) isn't a call — except where RUNS_ARGS lists a subcommand/flag that runs it
+Every cmux command a worker runs is checked (each ; && || | & newline segment) against an allowlist (WORKER_CMUX:
+agent message to its coordinator with a tag, identify, and notify, set-status, set-progress, read-screen --surface on
+its own surface only, no CMUX_* env override — check_own_target; the verb first), and every `orch verdict|criterion`
+call with every --role; text only a reader program reads (READERS: a cat/tee/git heredoc, echo/printf/grep/…, a
+commit message, orch --summary, a cmux report) isn't a call — except where RUNS_ARGS lists a subcommand/flag that runs it
 (orch gates/baseline --cmd, git grep -O, rg --pre, gh alias); any other program's quoted text is searched as text.
 Deadline: Claude Code runs the command when a hook times out (settings.json gives it 60s) or python3 is missing, so
 python3 is required and the guard keeps its own clock: about 45s overall (ORCH_GUARD_DEADLINE may lower it, never raise
@@ -59,8 +65,14 @@ can't know ($d from a loop or set earlier in the same command, xargs-built), env
 $'…'/variable-built verbs outside workers, orch held in a variable other than $ORCH or fed its subcommand by xargs,
 and cmux spelled in another case (CMUX on a case-insensitive volume), a cd target built by $(pwd) (only $PWD and
 $(git rev-parse --show-toplevel) are guessed), an absolute path to a program named git, and --git-dir=<repo>
-running that repo's hooks, a cat heredoc body inside an unquoted $( … ) / <( … ) (its output runs, but the body is
-read as data), printf -v capture later run by eval, and pushd -n / popd -n (taken as a cd; -n only edits the stack).
+running that repo's hooks, printf -v capture later run by eval, exec > >(sh) sending the shell's later output (a data
+heredoc's included) to a runner, a python list-form subprocess call (no `git push` text to match), a worker's
+cmux held in a variable or reached indirectly (C=$(which cmux); $C …, read/for/set -- variables,
+"$(command -v cmux)" …, exec -a <name> cmux …: like variable-built git verbs), a case pattern after a
+non-keyword prefix or a for variable named case/esac (case tracking), a worker's
+CMUX_* set from a file (env $(cat f) cmux …) or a cmux targeting option other than --surface/--workspace/--window
+(--panel, --tab), and pushd -n /
+popd -n (taken as a cd; -n only edits the stack).
 Outside a worker they get no decision (the user's rules apply), as every push and commit there does; a worker push
 in any of these shapes (env -C, /path/to/git, …) fails the exact-form match and is denied. The other way, a worker's non-reader command
 quoting a cmux verb (sed 's/cmux send/…/', python -c "…cmux send…") is denied: its text may run; and a cd named
@@ -69,8 +81,16 @@ coordinator's commit/PR (fails closed; write the message to a file: git commit -
 Also open (follow-up): a worker's `orch broadcast` is a case-sensitive text match, so $ORCH/${ORCH} broadcast isn't
 caught (as before this parser), while grep/commit text naming it is denied. Fail-closed false denies: the
 coordinator's cmux send after visiting a worktree ((cd <wt> && …) or pushd/popd) is checked as a worker's; a worker
-report with a $( … ) in its text, a cmux argument value equal to a forbidden verb (--body send), a worker push with a
-trailing # comment, and a verdict with a $( … ) argument plus a --summary naming a verdict call are denied. Cost:
+report with a $( … ) in its text, a worker's non-reader command naming cmux followed by a word (pytest -k cmux tests:
+read as cmux tests), a worker push with a trailing # comment, any python heredoc or python -c script naming a push,
+an evidence call or a cmux verb (python can run anything: write the script with the Write/Edit tool, then run the
+file: python3 script.py), sed/awk text naming a push, any ${…} beside push text (write $VAR), a worker's cmux
+notify/set-status/set-progress/read-screen with a $VAR argument or after a resume that changed its surface (the owner
+record keeps the registered one: orch register again), a worker command with $0/$@ and a cmux word, a worker's
+NAME=… prefix glued to a cmux word in text that may run (ORCH_CMUX=./stub/cmux bash t.sh: export it first, or write
+cmux commands without env prefixes), a worker command naming a CMUX_* variable next to a cmux word even to read it
+(printenv CMUX_SURFACE_ID; cmux identify), and a verdict with a
+$( … ) argument plus a --summary naming a verdict call are denied. Cost:
 each cmux command re-parses the text before it, so a coordinator command with hundreds of cmux lines can reach the
 deadline (fails closed in a worker or under a tier record).
 
@@ -713,10 +733,29 @@ def arg_heredocs(cmd):
 
 
 def doc_is_data(ev, k, text, b, e, quoted):
-    """A heredoc body only read: fed to cat or a git reader subcommand (commit -F -, …) at the start of its command,
-    not piped on, with a quoted delimiter or no $( … ) / backticks in it."""
-    return command_word(ev[k][1])[1] in ("cat", "git") and reads_only(ev[k][1]) \
-        and ev[k][2] in (";", "&&", "||", "&", "end") and (quoted or not RUNS.search(text[b:e]))
+    """A heredoc body only read: fed to cat, tee or a git reader subcommand (commit -F -, …) at the start of its
+    command, not piped on, with a quoted delimiter or no $( … ) / backticks in it. Never inside a $( … ) / backticks /
+    <( … ) / >( … ): their output is used (run, sourced, fed on)."""
+    if ev[k][2] not in (";", "&&", "||", "&", "end") or not (quoted or not RUNS.search(text[b:e])):
+        return False
+    scopes, cases = [], []  # cases: len(scopes) when each open case began
+    for x in ev[:k]:
+        if x[0] == "(":
+            scopes.append(x[1])
+        elif x[0] == ")" and len(scopes) > (cases[-1] if cases else 0):  # a case pattern's `x)` closes nothing
+            scopes.pop()
+        elif x[0] == "cmd":
+            for t in x[1].split():  # only a reserved word in command position counts (not echo esac, case esac in)
+                if t == "case":
+                    cases.append(len(scopes))
+                    break
+                if t == "esac":
+                    cases = cases[:-1]
+                elif t not in KEYWORDS and t not in OPENS and t not in CLOSES:
+                    break
+    if "$" in scopes:
+        return False
+    return command_word(ev[k][1])[1] in ("cat", "git", "tee") and reads_only(ev[k][1])
 
 
 def piped_to_runner(ev):
@@ -1039,19 +1078,49 @@ def unquoted(cmd):
     return re.sub(r"[\"'\\]", "", re.sub(r"\$'((?:[^'\\]|\\.)*)'", ansi, cmd))
 
 
-def check_worker_indirection(data, cmd, raw):
+# a plain $VAR / ${VAR} as a redirection's target (>> $PROG, > "${F}"): it names a file; as an argument it could be a
+# flag that runs something (git grep $OPT = -O…, rg $OPT = --pre=…)
+TARGET_REF = re.compile(r"(?:\d*|&)>>?\|?[ \t]*[\"']?\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})")
+
+
+def live_indirection(cmd):
+    """cmd (data strings blanked) uses indirection that may build or run text: anything but a plain $VAR / ${VAR}
+    redirection target of a command that only reads (echo "…" >> $PROG, cat >> "$F" <<EOF). Unparseable, piped into a
+    runner, a $( … ) / backticks / <( … ), a heredoc that may run, a $VAR argument, or a variable as the program →
+    live."""
+    ev, docs, bad = commands(cmd)
+    if bad or piped_to_runner(ev):
+        return True
+    if any(not doc_is_data(ev, k, cmd, b, e, quoted) for k, b, e, quoted in docs):
+        return True
+    for e in ev:
+        if e[0] == "(" and e[1] == "$":
+            return True
+        if e[0] == "cmd" and INDIRECTION.search(e[1]) and (
+                not reads_only(e[1]) or INDIRECTION.search(TARGET_REF.sub(">", e[1]))):
+            return True
+    return False
+
+
+def check_worker_indirection(data, cmd, raw, plain=None):
     """Inside a worker, a command that mentions push in any spelling AND uses shell indirection, or a git push written
     with any quote/backslash, is denied instead of parsed (threat model: accidental shortcuts, not a hostile agent;
     parsing every obfuscation is unbounded). The one allowed push needs neither. A `cat <<EOF` body is data (the
     usual heredoc commit message), so it doesn't count unless the opener line pipes it on. cmd has its data strings
-    blanked (blank_data): their text and $VAR inside them don't count as indirection or a quoted push, but a push
-    mentioned in them still pairs with indirection elsewhere (raw)."""
+    and only-read bodies blanked: their text and $VAR inside them don't count as indirection or a quoted push. A push
+    mentioned only there (raw) still pairs with indirection elsewhere, unless that is only a plain $VAR given to a
+    command that reads (live_indirection of plain: raw with just its data strings blanked)."""
+    plain = raw if plain is None else plain
+    # every body counts (cat > $F <<EOF … may be run later), except a commit/PR-message "$(cat <<'EOF' …)" argument
+    stored = arg_heredocs(raw)
+    in_data = PUSH_WORD.search(stored) or PUSH_WORD.search(unquoted(stored))
     # only the body lines go; the opener line stays, and a body piped on (cat <<EOF | sh) is never stripped
     cmd, raw = (re.sub(r"(\bcat\s+<<-?\s*(['\"]?)(\w+)\2[^\n|]*)\n.*?^\s*\3\s*$", r"\1", c, flags=re.S | re.M)
                 for c in (cmd, raw))
     # a git push spelled with quotes/backslashes anywhere in its simple command (git 'push', git"" push, -c 'a b')
     quoted = any(re.search(r"[\"'\\]", seg) and PUSH.search(unquoted(seg)) for seg in re.split(r"[;&|\n]", cmd))
-    if not quoted and not (INDIRECTION.search(cmd) and (PUSH_WORD.search(raw) or PUSH_WORD.search(unquoted(raw)))):
+    pushy = PUSH_WORD.search(cmd) or PUSH_WORD.search(unquoted(cmd))  # outside data: any indirection pairs with it
+    if not quoted and not (INDIRECTION.search(cmd) and (pushy or (in_data and live_indirection(plain)))):
         return
     for cwd in sorted(cwd_at(data, cmd)[1]):
         owner = owner_of(cwd)[0]
@@ -1189,7 +1258,7 @@ ROLE_AGENTS = {"reviewer": {"reviewer"}, "adversarial": {"reviewer"}, "verifier"
 
 
 # programs whose quoted arguments are only read (printed, searched, stored as a message), never run
-READERS = DATA_PROGS | {"cat", "gh", "orch", "true", "test", "["}
+READERS = DATA_PROGS | {"cat", "tee", "gh", "orch", "true", "test", "["}
 GIT_READERS = {"commit", "log", "tag", "show", "grep"}
 WRAPPERS = {"env", "xargs", "sudo", "nohup", "nice", "exec", "time", "command", "builtin", "timeout", "stdbuf"}
 
@@ -1306,11 +1375,24 @@ def check_evidence_writer(data, cmd):
 
 
 CMUX_WORD = re.compile(r"(?<![\w.-])cmux(?![\w.-])")  # cmux, /path/to/cmux; not cmux-x / .cmux
+# a CMUX_* variable named outside data (CMUX_SURFACE_ID=…, export/read/printf -v CMUX_…): it retargets cmux. A $CMUX_…
+# reference is only read (a $-built cmux argument is denied on its own).
+CMUX_ENV = re.compile(r"(?<![\w${])CMUX_\w+")
+POSITIONAL = re.compile(r"\$(?:[0-9@*]|\{[0-9@*])")  # bash -c '$0 tree' cmux: cmux arrives as an argument
+NAMED_BY = [["-name"], ["-iname"], ["-path"], ["-ipath"], ["-wholename"]]
 WORKER_TAGS = ("QUESTION:", "NEEDS_FILES:", "BLOCKED:", "MERGED:", "PROGRESS:", "DONE:")
-WORKER_FORBIDDEN = {"send", "send-key", "paste", "new-workspace", "close-workspace", "workspace",
-                    "new-split", "new-pane", "claude-teams", "close-surface", "workspace-group",
-                    "send-panel", "send-key-panel", "paste-buffer", "close-window", "tab-action", "workspace-action",
-                    "new-window", "new-surface", "respawn-pane", "codex-teams"}
+# the only cmux commands a worker runs (the verb first, no option before it); every other verb is denied
+WORKER_CMUX = ("agent message", "identify", "notify", "set-status", "set-progress", "read-screen")
+WORKER_CMUX_FORMS = ("cmux agent message <coordinator> --from <owner> \"<TAG>: …\", cmux identify, cmux notify, "
+                     "cmux set-status, cmux set-progress, cmux read-screen --surface <your own surface>")
+
+
+def lookup(before):
+    """The words before a cmux word end in `command -v` / `command -V` (with -p): it is looked up, not run."""
+    i = len(before)
+    while i and before[i - 1] in ("-v", "-V", "-p"):
+        i -= 1
+    return i < len(before) and {"-v", "-V"} & set(before[i:]) and i and before[i - 1] == "command"
 
 
 def check_worker_messaging(data, cmd):
@@ -1321,6 +1403,11 @@ def check_worker_messaging(data, cmd):
         return
     session = owner_of(data.get("cwd") or os.getcwd())[0]
     text, cmds, strict = walk(cmd)
+    if session is not None:
+        live = inert_text(blank_data(text))  # report/commit/grep text and bodies only read don't count
+        if CMUX_ENV.search(live):
+            decide("deny", "Workers never set CMUX_* variables (they pick which surface/workspace cmux acts on). "
+                           "Run cmux plainly: cmux agent message <coordinator> --from <owner> \"PROGRESS: …\"")
 
     def owner_at(pos):
         if session is not None:
@@ -1336,6 +1423,10 @@ def check_worker_messaging(data, cmd):
         if command_word(shlex.join(toks))[1] == "cmux":  # the program, past env/xargs/sudo; not grep cmux …
             k = next(k for k, t in enumerate(toks) if t.rsplit("/", 1)[-1] == "cmux")
             owner = owner_at(at)
+            if owner is not None and any(CMUX_ENV.match(t) for t in toks[:k]):
+                decide("deny", "Workers never set CMUX_* variables (they pick which surface/workspace cmux acts on).")
+            if lookup(toks[:k]):  # command -v cmux: a lookup, not a call
+                continue
             if owner is not None and "xargs" in (t.rsplit("/", 1)[-1] for t in toks[:k]):  # its args come from stdin
                 decide("deny", "Write cmux commands from a worker plainly, without xargs: "
                                "cmux agent message <coordinator> --from <owner> \"PROGRESS: …\"")
@@ -1358,23 +1449,32 @@ def check_worker_messaging(data, cmd):
                 toks = shlex.split(words)[1:]
             except ValueError:  # a match inside someone else's quotes (grep "cmux" .): its words, quotes dropped
                 toks = re.sub(r"[\"'\\]", " ", words).split()[1:]
+            # text naming cmux with no verb after it (which cmux, chmod +x stub/cmux) or a dir named cmux
+            # (sed '/cmux/p', skills/cmux/x) calls nothing — unless a wrapper earlier in its simple command runs it
+            # with arguments from elsewhere (xargs cmux, env cmux)
+            lead = re.sub(r"[\"'\\]", " ", re.split(r"[;&|()`\n]", piece[:m.start()])[-1])  # bash -c 'xargs cmux'
+            words = lead.split()
+            if lookup(words):  # command -v cmux: a lookup, not a call
+                continue
+            fed = any(w.rsplit("/", 1)[-1] in WRAPPERS for w in words) or POSITIONAL.search(piece)
+            if (not toks and not fed) or piece[m.end():m.end() + 1] == "/" or lead.split()[-1:] in NAMED_BY:
+                continue  # also find -name cmux / -path …/cmux: a file name, not a call
             run = check_cmux(owner, toks, run)
 
 
 def check_cmux(owner, toks, run):
-    """One cmux command from a worker (toks follow `cmux`). Returns run.json once read."""
-    agent = next((k for k in range(len(toks) - 1) if toks[k:k + 2] == ["agent", "message"]), None)
-    head = toks if agent is None else toks[:agent]  # a message body may name a verb; what precedes it may not
-    verb = next((t for t in head if t in WORKER_FORBIDDEN), None)
-    if verb:
-        decide("deny", f"Workers may not run `cmux {verb}` (no driving other terminals/workspaces). "
+    """One cmux command from a worker (toks follow `cmux`): only a WORKER_CMUX verb, written first. Returns run.json
+    once read."""
+    verb = "agent message" if toks[:2] == ["agent", "message"] else (toks[0] if toks else "")
+    if verb not in WORKER_CMUX or toks[:1] == ["agent message"]:  # one quoted word isn't the two-word verb
+        decide("deny", f"Workers may run only these cmux commands: {WORKER_CMUX_FORMS} "
+                       f"(not `cmux {' '.join(toks[:2])}`; no driving other terminals/workspaces). "
                        f"Send a tagged report to your coordinator.")
-    if any("$" in t for t in (toks[:1] if agent is None else head)):  # $V / ${V}: a subcommand it can't read
-        decide("deny", "Write cmux commands from a worker plainly (no $-built or quoted subcommand).")
-    if agent is None:
+    if verb != "agent message":
+        check_own_target(owner, verb, toks[1:])
         return run
     run = run or json.loads((ORCH_HOME / "runs" / owner["run"] / "run.json").read_text())
-    toks = toks[agent + 2:]
+    toks = toks[2:]
     target, text, i, reply = None, [], 0, False
     while i < len(toks):
         t = toks[i]
@@ -1401,6 +1501,32 @@ def check_cmux(owner, toks, run):
     return run
 
 
+def check_own_target(owner, verb, args):
+    """A worker's notify / set-status / set-progress / read-screen acts only on its own surface: no --workspace or
+    --window, and a --surface only the one it registered from (orchestra-owner.json "workspace"); read-screen needs
+    exactly that one --surface. identify only reads, so it may name any. A $-built argument may be a target: denied."""
+    if verb == "identify":
+        return
+    if any("$" in a for a in args):
+        decide("deny", f"From a worker, write cmux {verb} arguments plainly (no $VAR: it may name another surface).")
+    own, surfaces, i = owner.get("workspace"), [], 0
+    while i < len(args):
+        name, eq, val = args[i].partition("=")
+        if name in ("--workspace", "--window"):
+            surfaces.append(None)
+        elif name == "--surface":
+            surfaces.append(val if eq else (args[i + 1] if i + 1 < len(args) else None))
+            i += 0 if eq else 1
+        i += 1
+    mine = own or "<your surface (not registered: run orch register inside cmux)>"  # resumed elsewhere: register again
+    if verb == "read-screen" and (not own or surfaces != [own]):
+        decide("deny", f"From a worker, read only your own screen: cmux read-screen --surface {mine} "
+                       f"(no other --surface, --workspace or --window).")
+    if any(s is None or s != own for s in surfaces):
+        decide("deny", f"From a worker, cmux {verb} acts only on your own surface: no --workspace/--window, "
+                       f"and --surface only {mine}.")
+
+
 def main(data):
     if data.get("tool_name") != "Bash":
         return
@@ -1411,7 +1537,7 @@ def main(data):
     check_evidence_writer(data, raw)
     check_worker_messaging(data, raw)
     cmd = raw if continued else inert_text(blank_data(raw))  # quoted data and bodies only read aren't pushes
-    check_worker_indirection(data, cmd, raw)
+    check_worker_indirection(data, cmd, raw, raw if continued else blank_data(raw))
     here = owner_of(data.get("cwd") or os.getcwd())[0] if PUSH.search(cmd) else None
     exact = True
     if here is not None:  # a worker push is the whole command (an allow would approve the chain; a prompt would
