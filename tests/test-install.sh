@@ -64,8 +64,9 @@ H="$S/h1"; C="$H/.claude"; newhome "$H"
 cp "$C/CLAUDE.md" "$S/orig-claude.md"; cp "$C/settings.json" "$S/orig-settings.json"
 INST --yes --no-web --skip-tests
 ok "exits 0" '[ $rc = 0 ]'
-for dep in cmux python3 git gh gitleaks Playwright context7 Maestro xcbeautify; do
+for dep in cmux python3 git gh gitleaks Playwright context7; do
   ok "dependency table lists $dep" 'grep -E "^ *$dep" <<< "$out" | grep -qE "found|missing|optional|required"'; done
+ok "dependency table has no Maestro/xcbeautify (iOS) rows" '! grep -qiE "^ *(maestro|xcbeautify)" <<< "$out"'
 ok "skills/agents/orchestra/statusline copied" 'cmp -s "$ROOT/skills/worker/SKILL.md" "$C/skills/worker/SKILL.md" && cmp -s "$ROOT/agents/verifier.md" "$C/agents/verifier.md" && cmp -s "$ROOT/orchestra/hooks/push-guard.py" "$C/orchestra/hooks/push-guard.py" && cmp -s "$ROOT/statusline/statusline.py" "$C/statusline/statusline.py"'
 ok "orch is executable" '[ -x "$C/orchestra/bin/orch" ]'
 ok "repo-only files not copied" '[ ! -e "$C/install.sh" ] && [ ! -e "$C/scripts" ] && [ ! -e "$C/tests" ]'

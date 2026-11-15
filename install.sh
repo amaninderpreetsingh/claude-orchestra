@@ -71,7 +71,7 @@ if has "$CMUX"; then row cmux required found; else row cmux required "missing �
 PYBAD=""
 if has python3 && PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3, 9))' 2>/dev/null); then
   # smoke test: each hook (push-guard.py) must load with this interpreter: one that can't would fail closed on every
-  # push/commit/cmux command in every repo (or, for a hook without that guard, be silently off)
+  # command naming push, cmux or broadcast in every repo (or, for a hook without that guard, be silently off)
   for hook in "$SRC"/orchestra/hooks/*.py; do
     [ -f "$hook" ] || continue
     if ! err=$(python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location("hook", sys.argv[1]); s.loader.exec_module(u.module_from_spec(s))' \
@@ -92,15 +92,11 @@ else row "Playwright MCP" optional "not set up — needs node/npx first (brew in
 if mcp_has context7; then row context7 optional "found (user scope)"
 elif has npx; then row context7 optional "found (workers start it with npx via orchestra/worker-mcp.json)"
 else row context7 optional "missing — needs node/npx (workers start it via orchestra/worker-mcp.json)"; fi
-for t in maestro xcbeautify; do
-  n=$([ $t = maestro ] && echo Maestro || echo xcbeautify)
-  if has $t; then row "$n" optional "found (iOS native slices)"; else row "$n" optional "missing — only for iOS native slices"; fi
-done
 echo
 if [ ${#MISSING[@]} -gt 0 ]; then
   if [[ " ${MISSING[*]} " == *" cmux "* ]]; then
     cat >&2 <<'EOF'
-cmux is required: every worker runs in its own cmux workspace, and the coordinator talks to it with
+cmux is required: every worker runs in its own cmux workspace, and workers and the manager talk with
 `cmux agent message`. Install it, open it once, and run this installer again from a cmux terminal:
     brew install --cask cmux
 (or download it from the cmux website). Check: `cmux identify --json` prints a caller.
@@ -111,7 +107,7 @@ EOF
 fi
 if [ -n "$PYBAD" ]; then
   echo "install.sh: $PYBAD" >&2
-  echo "install.sh: with it, every push, commit and cmux command would be denied. Use a python3 it loads with (brew install python) first on PATH, and rerun. Nothing was written." >&2
+  echo "install.sh: with it, the guard would deny every command naming push, cmux or broadcast, or (if it can't compile) be silently off. Use a python3 it loads with (brew install python) first on PATH, and rerun. Nothing was written." >&2
   exit 1
 fi
 # ---------- 2. questions (before anything is written) ----------
