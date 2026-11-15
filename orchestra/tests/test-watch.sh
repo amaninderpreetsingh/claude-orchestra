@@ -190,4 +190,28 @@ out=$(PATH=$S/nocmux:$PATH ORCH_CMUX=$S/alt/mycmux $W --run r6 --once 2>&1); rc=
 ok "ORCH_CMUX set → its tree is read: EVENT DEAD S1" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD S1 surface-gone surface:11" ]'
 mv $S/alt/mycmux $S/bin/cmux
 
+echo "-- stable ids: a reused surface ref is someone else's"
+mkdir -p $S/hang
+mkrun r7 surface:90 S1:surface:11; claude ttys1; claude ttys9
+python3 - $ORCH_HOME/runs/r7/workers/S1.json <<'EOF'
+import json, sys; p = sys.argv[1]; w = json.load(open(p)); w["surface_id"] = "S-OWN"; json.dump(w, open(p, "w"))
+EOF
+idtree(){ printf '{"windows":[{"workspaces":[{"ref":"workspace:1","panes":[{"ref":"pane:1","surfaces":[{"ref":"surface:11","id":"%s","tty":"ttys1"},{"ref":"surface:90","tty":"ttys9"}]}]}]}]}' "$1" > $FX/tree.json; }
+idtree S-OTHER
+watch --run r7 --once; ok "worker's surface uuid gone, its ref reused → EVENT DEAD S1" '[ $rc = 0 ] && [ "$out" = "EVENT DEAD S1 surface-gone surface:11" ]'
+idtree S-OWN; printf 'some output\n\n  ⎿  You'"'"'ve hit your limit · resets 3am (America/New_York)\n\n> \n' > $FX/screen-surface:11; : > $FX/screen-S-OWN
+watch --run r7 --once; ok "own uuid live → screen read by uuid, not by the ref (no event)" '[ $rc = 3 ] && [ -z "$out" ]'
+mv $FX/screen-surface:11 $FX/screen-S-OWN
+watch --run r7 --once; ok "...the uuid's own banner is seen" '[ $rc = 0 ] && [[ "$out" == "EVENT USAGE_LIMIT S1 "* ]]'
+rm -f $ORCH_HOME/state/watch-r7.json; tree surface:11:ttys1 surface:90:ttys9   # a cmux that lists no uuids at all
+watch --run r7 --once; ok "tree without uuids: a worker with a recorded uuid is not DEAD (read by its ref)" '[[ "$out" != *DEAD* ]]'
+cat > $S/hang/cmux <<'EOF'
+#!/bin/sh
+[ "$1" = tree ] && sleep 30
+exit 1
+EOF
+chmod +x $S/hang/cmux; rm -f $ORCH_HOME/state/watch-r7.json
+t0=$(date +%s); out=$(PATH=$S/hang:$PATH $W --run r7 --once 2>&1); rc=$?; el=$(( $(date +%s) - t0 ))
+ok "hung cmux: one tree timeout per poll, not two (${el}s)" '[ $el -lt 18 ]'
+
 echo; echo "PASSED $PASS  FAILED $FAIL"; [ $FAIL = 0 ]

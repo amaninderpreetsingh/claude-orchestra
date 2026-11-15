@@ -46,17 +46,30 @@ def write_json(p, data):
     tmp.replace(p)
 
 
-def cmux(*args):
+def cmux_rc(*args):
+    """(returncode, stdout); 124 hung, 127 not runnable."""
     try:
         r = subprocess.run([CMUX, *args], capture_output=True, text=True, timeout=10)
-        return r.stdout if r.returncode == 0 else None
+        return r.returncode, r.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ""
     except Exception:
-        return None
+        return 127, ""
+
+
+def cmux(*args):
+    rc, out = cmux_rc(*args)
+    return out if rc == 0 else None
 
 
 def live_surfaces():
-    """{ref: tty} for every live workspace/surface, or None when cmux can't tell (→ nobody is dead)."""
-    out = cmux("tree", "--all", "--json")
+    """{ref or uuid: tty} for every live workspace/surface, or None when cmux can't tell (→ nobody is dead).
+    A short ref (surface:N) is reused once its surface closes; the uuid (`--id-format both`) is stable."""
+    rc, out = cmux_rc("tree", "--all", "--json", "--id-format", "both")
+    if rc not in (0, 124, 127):  # a cmux from before --id-format: refs only (hung or missing: no second try)
+        rc, out = cmux_rc("tree", "--all", "--json")
+    if rc != 0:
+        return None
     try:
         tree = json.loads(out)
     except Exception:
@@ -67,6 +80,8 @@ def live_surfaces():
             ref = str(o.get("ref", ""))
             if ref.startswith(("workspace:", "surface:")):
                 live[ref] = o.get("tty")
+                if isinstance(o.get("id"), str) and o["id"]:
+                    live[o["id"]] = o.get("tty")
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
@@ -140,12 +155,16 @@ def local_iso(epoch):
 
 def check(t, e, live, a, now):
     """Event (kind, detail) for target t, updating its watch-state entry e in place; None if nothing new."""
-    ref = t["ref"]
+    ref = t["ref"]  # shown in events
+    # read/typed into: the surface's uuid when spawn recorded one, never a reused surface:N — unless this cmux lists
+    # no uuids at all (then the ref, as before ids)
+    ids = not live or any(not k.startswith(("workspace:", "surface:")) for k in live)  # as orch's has_ids
+    addr = t.get("id") if t.get("id") and ids else ref
     dead = None
     if live is not None:
-        if ref not in live:
+        if addr not in live:
             dead = "surface-gone"
-        elif live[ref] and claude_gone(live[ref]):
+        elif live[addr] and claude_gone(live[addr]):
             dead = "no-claude"
     def become(kind, **kw):  # new state; the last resume (time + banner) survives (stall clock restarts at a resume)
         kept = {k: e[k] for k in ("resumed_epoch", "resumed_banner") if k in e and k not in kw}
@@ -157,7 +176,7 @@ def check(t, e, live, a, now):
         become("DEAD")
         return "DEAD", f"{dead} {ref}"
     def screen_banner():
-        return banner_text(cmux("read-screen", flag(ref), ref, "--lines", "40"))
+        return banner_text(cmux("read-screen", flag(addr), addr, "--lines", "40"))
     hit = screen_banner()
     banner = hit and hit[0]
     if e.get("resumed_banner") and banner != e["resumed_banner"]:
@@ -176,10 +195,10 @@ def check(t, e, live, a, now):
             # cmux send fails (sends nothing) when the prompt holds text or a dialog is open → retry next poll;
             # once "continue" is typed, a failed Enter is retried alone (typing it again would fail on the held text)
             if not e.get("typed"):
-                if cmux("send", flag(ref), ref, "continue") is None:
+                if cmux("send", flag(addr), addr, "continue") is None:
                     return None
                 e["typed"] = True
-            if cmux("send-key", flag(ref), ref, "enter") is None:
+            if cmux("send-key", flag(addr), addr, "enter") is None:
                 return None
             e.pop("typed")
             e.update(kind="RESUMED", resumed_epoch=now, resumed_banner=banner)
@@ -213,7 +232,7 @@ def targets(run_dir, r, a):
             started = datetime.fromisoformat(wk["started"]).timestamp()
         except Exception:
             started = None
-        out.append({"name": wk["slice"], "ref": wk["workspace"], "started": started,
+        out.append({"name": wk["slice"], "ref": wk["workspace"], "id": wk.get("surface_id"), "started": started,
                     "progress": run_dir / "slices" / f"{wk['slice']}.progress.md"})
     if a.coordinator and r.get("coordinator"):
         out.append({"name": "coordinator", "ref": r["coordinator"]})

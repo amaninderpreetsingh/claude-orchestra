@@ -59,12 +59,12 @@ A round reviews one gated, squashed HEAD. When it ends, append `step 4 round <n>
 3. **Any blocking → §5.** A clean middle round → the full round on the same HEAD. A clean full round → its advisories go to the report, then `verifier` (mode full): worktree, run id, base `origin/$T`, criteria with check notes, type, native flag + the brief's native recipe and memory file paths, owner name, dev-server/emulator commands + your ports (`$ORCH_PORT..$ORCH_PORT_END` — give the numbers), gate commands + the gate record, test accounts, artifacts dir, Repro. PASS → §6; FAILURE → §5.
 
 ## 5. Fix, then the next round
-First match wins:
+**Re-tier first**: a lite BLOCK "re-tier" → `QUESTION: re-tier as code?`, end your turn — even in the cap round (it is a question, never BLOCKED). Otherwise first match wins:
 1. **Cap**: blocking or FAILURE in the review tier's cap round or later → consult `oracle` once (goal, failing evidence, diff, what you tried), write `## Learned` in `$PROG` (each round's blockers, what was tried, why it failed, oracle's view), send `BLOCKED: <one line>`, end your turn.
 2. **Repeat**: same defect as the previous round's line → `QUESTION: <file — defect> in rounds <n-1> and <n>; tried: <what>`, end your turn; apply the answer in 5.3.
-3. **Fix** every blocking finding and FAILURE at the root cause, plus every advisory inside your Touches. **No widening**: a fix that adds an exemption, allow or default needs a test of that same input, watched failing first. Re-squash, re-gate (§3), next round from 4.1. A lite BLOCK "re-tier" → `QUESTION: re-tier as code?`, end your turn.
+3. **Fix** every blocking finding and FAILURE at the root cause. Advisories inside your Touches may ride along in the same fix (optional; keep them small), except a pre-existing defect — the rule below wins. **No widening**: a fix that adds an exemption, allow or default needs a test of that same input, watched failing first. Re-squash, re-gate (§3), next round from 4.1.
 
-A defect that predates your diff on lines it touches → `QUESTION: fix-slice candidate — <file:line — defect>` at once (never only in MERGED), then carry on.
+A defect that predates your diff on lines it touches → `QUESTION: fix-slice candidate — <file:line — defect>` at once (never only in MERGED, never fixed silently under 5.3), then carry on.
 
 ## 6. Integrate — the merge lock covers only rebase + push
 1. **Sync**: `git fetch origin && git rebase origin/$T`. Conflicts: keep both sides' intent; regenerate lock/generated files. If HEAD changed: re-run gates, then patch unchanged → verifier in `specs-only` mode (reviewer verdicts carry over); conflicts resolved or upstream touched your files (the patch changed) → a full round from 4.1. Verifier FAILURE → §5.

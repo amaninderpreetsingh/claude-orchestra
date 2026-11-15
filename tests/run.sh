@@ -20,11 +20,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 #   test-guard-bypass.sh  guard deadlines: a deny must land within ORCH_GUARD_DEADLINE (el ≤ 6s / ≤ 10s)
 #   test-watch.sh         orch-watch --timeout/--interval: elapsed time must fall in [2,6]s / ≤ 6s
 #   test-sim.sh           orch-sim lock waits: "waited ≥ 1s" behind a 1.5s holder, "< 5s" past a killed one
-#   test-orch-reap.sh     close/reap read the argv/cwd of helpers given a 0.3s head start, and wait on
-#                         listeners with 6s up/down polls
-#   test-orch-reap-timing.sh  those timing checks of test-orch-reap.sh, split out into their own suite
+#   test-orch-reap-timing.sh  close/reap read the argv/cwd of helpers given a 0.3s head start, and wait on
+#                         listeners with 6s up/down polls (test-orch-reap.sh keeps the non-timing checks)
 # Only suites that were found or named are matched against this list, so a name here without a file is harmless.
-SOLO=" test-guard-bypass.sh test-watch.sh test-sim.sh test-orch-reap.sh test-orch-reap-timing.sh "
+SOLO=" test-guard-bypass.sh test-watch.sh test-sim.sh test-orch-reap-timing.sh "
 JOBS=${ORCH_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 case "$JOBS" in ''|*[!0-9]*|0) echo "run.sh: ORCH_TEST_JOBS must be a positive integer (got '$JOBS')"; exit 1 ;; esac
 if [ $# -gt 0 ]; then

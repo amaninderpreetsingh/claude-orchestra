@@ -2,19 +2,19 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Scenario tests for orch + push-guard (isolated ORCH_HOME, local bare origin).
 set -u
-S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch.XXXXXX"); trap 'rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
+S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch.XXXXXX"); trap 'for c in $(cat $S/caff.log 2>/dev/null); do kill $c 2>/dev/null; done; rm -rf $S' EXIT; cd $S  # unique: workers run suites concurrently
 export ORCH_HOME=$S/home; O=$ROOT/bin/orch; H=$ROOT/hooks/push-guard.py
 hard(){ perl -MPOSIX -e '$t = shift; $p = fork // die; unless ($p) { POSIX::setsid(); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill 9, -$p, $p; exit 137 }; alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' 60 "$@"; }  # every hook call under a 60s wall clock (SIGKILL: blocking signals can't dodge it): a hang fails the case, never stalls the suite
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
+export ORCH_PORT_BASE=${ORCH_TEST_PORT_BASE:-$((30000 + $$ % 300 * 100))} ORCH_PORT_SPAN=90  # private port range: suites never share a block
 # fakes on PATH: caffeinate logs its pid and idles; cmux (spawn tests only) logs args, answers from $S/groups.json
 mkdir -p $S/stub $S/cmuxstub; export CAFF_LOG=$S/caff.log CMUX_LOG=$S/cmux.log
-printf '#!/bin/sh\necho $$ >> "$CAFF_LOG"\nsleep 120 & trap "kill $! 2>/dev/null; exit" TERM\nwait\n' > $S/stub/caffeinate
+printf '#!/bin/sh\ntrap '"'"'kill $! 2>/dev/null; exit'"'"' TERM\necho $$ >> "$CAFF_LOG"\nsleep 120 & wait\n' > $S/stub/caffeinate  # trap first: no orphan sleep
 cat > $S/cmuxstub/cmux <<'EOF'
 #!/bin/sh
 echo "$*" >> "$CMUX_LOG"
 case "$1 $2" in
   "identify --json") echo '{"caller":{}}';;
-  "tree --all"*) echo '{"windows":[{"workspaces":[{"ref":"workspace:5","panes":[{"ref":"surface:51"}]}]}]}';;
+  "tree --all"*) echo '{"windows":[{"workspaces":[{"ref":"workspace:5","id":"W5","panes":[{"ref":"surface:51","id":"S51"}]}]}]}';;
   "new-workspace "*) echo "OK workspace:5";;
   "workspace-group list") cat "$(dirname "$CMUX_LOG")/groups.json" 2>/dev/null || echo '{"groups":[]}';;
   "workspace-group create") echo "OK workspace_group:9";;
@@ -22,7 +22,7 @@ esac
 EOF
 for x in xcrun osascript; do printf '#!/bin/sh\necho "$*" >> "$(dirname "$CAFF_LOG")/xcrun.log"\n' > $S/stub/$x; done   # no suite may touch real simulators
 printf '#!/bin/sh\nexit 0\n' > $S/stub/pgrep                                       # "Simulator app is running"
-chmod +x $S/stub/caffeinate $S/stub/xcrun $S/stub/osascript $S/stub/pgrep $S/cmuxstub/cmux; export PATH=$S/stub:$PATH
+chmod +x $S/stub/caffeinate $S/stub/xcrun $S/stub/osascript $S/stub/pgrep $S/cmuxstub/cmux; export PATH=$S/stub:$PATH ORCH_CAFFEINATE=$S/stub/caffeinate  # an isolated ORCH_HOME holds none otherwise
 PASS=0; FAIL=0
 expect(){ # expect <label> <want: allow|ask|deny|silent> <cwd> <cmd>
   out=$(printf '%s' "{\"tool_name\":\"Bash\",\"cwd\":\"$3\",\"tool_input\":{\"command\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$4")}}" | hard python3 $H 2>&1); rc=$?
@@ -33,7 +33,7 @@ no(){ if "$@" >/dev/null 2>&1; then FAIL=$((FAIL+1)); echo "FAIL cmd should fail
 
 git init -q --bare -b main origin.git; git clone -q origin.git repo 2>/dev/null; cd repo
 echo 'echo ok' > gate.sh; echo a > a.txt; git add .; git commit -qm init; git push -q origin main; git remote set-head origin main
-R=$S/repo; RUN=$($O new-run --repo $R --title t --coordinator workspace:0); ok $O run-branch --run $RUN
+R=$S/repo; RUN=$($O new-run --repo $R --title t$$ --coordinator workspace:0); ok $O run-branch --run $RUN
 git fetch -q; git worktree add -q .claude/worktrees/w1 -b w1 origin/orch/$RUN; git worktree add -q .claude/worktrees/w2 -b w2 origin/orch/$RUN; git worktree add -q .claude/worktrees/plain -b plain origin/main
 W1=$R/.claude/worktrees/w1; W2=$R/.claude/worktrees/w2; P=$R/.claude/worktrees/plain
 echo "-- unregistered"
@@ -105,20 +105,20 @@ echo "-- caffeinate held while any run is active"
 CP=$ORCH_HOME/state/caffeinate.pid; alive(){ [ -f $CP ] && kill -0 "$(cat $CP)" 2>/dev/null; }
 ok test "$(wc -l < $CAFF_LOG | tr -d ' ')" = 1                    # new-run at the top started exactly one
 ok test ! -f $CP                                                  # ...and the last end-run released it
-CA=$($O new-run --repo $R --title ca --coordinator workspace:0); ok alive
-CB=$($O new-run --repo $R --title cb --coordinator workspace:0)
+CA=$($O new-run --repo $R --title ca$$ --coordinator workspace:0); ok alive
+CB=$($O new-run --repo $R --title cb$$ --coordinator workspace:0)
 ok test "$(wc -l < $CAFF_LOG | tr -d ' ')" = 2                    # second run reuses the held one
 ok $O end-run --run $CA --status aborted --keep-sim; ok alive    # CB still active
 CPID=$(cat $CP); ok $O end-run --run $CB --status aborted --keep-sim
 no alive; no kill -0 $CPID
-echo 99999999 > $CP; CC=$($O new-run --repo $R --title cc --coordinator workspace:0); ok alive   # stale pid → new one
+echo 99999999 > $CP; CC=$($O new-run --repo $R --title cc$$ --coordinator workspace:0); ok alive   # stale pid → new one
 python3 - $ORCH_HOME/runs/$CC/run.json <<'PY'
 import json,sys; p=sys.argv[1]; r=json.load(open(p)); r["status"]="aborted"; json.dump(r,open(p,"w"))
 PY
 CPID=$(cat $CP); ok $O reap --keep-sim; no alive; no kill -0 $CPID   # reap with no active run releases it
 
 echo "-- spawn: --model + coordinator-anchored group"
-SP=$($O new-run --repo $R --title sp --coordinator surface:30 --coordinator-workspace workspace:3); D=$ORCH_HOME/runs/$SP
+SP=$($O new-run --repo $R --title sp$$ --coordinator surface:30 --coordinator-workspace workspace:3); D=$ORCH_HOME/runs/$SP
 printf '# A\n- RUN: x\n' > $D/slices/A.md; printf '# B\n- MODEL: sonnet\n' > $D/slices/B.md
 cat > $S/groups.json <<'EOF'
 {"groups":[{"ref":"workspace_group:1","anchor_workspace_ref":"workspace:2","member_workspace_refs":["workspace:2","workspace:3"]}]}
@@ -145,7 +145,7 @@ printf '# C\n- **MODEL:** haiku\n' > $D/slices/C.md; printf '# E\nset it with a 
 unset ORCH_SKIP_TRUST; env PATH=$S/cmuxstub:$PATH $O end-run --run $SP --status aborted --keep-sim >/dev/null 2>&1
 
 echo "-- gates: logs + summary, hygiene"
-HY=$($O new-run --repo $R --title hy --coordinator workspace:0); cd $R; git fetch -q
+HY=$($O new-run --repo $R --title hy$$ --coordinator workspace:0); cd $R; git fetch -q
 git worktree add -q .claude/worktrees/hy -b hy origin/main; WH=$R/.claude/worktrees/hy; ok $O register --worktree $WH --run $HY --slice h
 cd $WH; printf 'echo compiling\necho "src/a.ts:3 error TS2322: bad type"\necho trailing\nexit 2\n' > tsc.sh
 printf 'for i in 1 2 3 4 5 6 7; do echo line$i; done\nexit 1\n' > quiet.sh; git add .; git commit -qm gatescripts
@@ -189,11 +189,11 @@ cd $R; $O end-run --run $HY --status aborted --keep-sim >/dev/null 2>&1
 
 echo "-- simulators: only orch-sim reap, never 'simctl shutdown all'"
 mkdir -p $S/bin; cp $O $S/bin/orch; printf '#!/bin/sh\necho "$*" >> "%s/orch-sim.log"\n' $S > $S/bin/orch-sim; chmod +x $S/bin/orch-sim
-SM=$($O new-run --repo $R --title sm --coordinator workspace:0); : > $S/xcrun.log
+SM=$($O new-run --repo $R --title sm$$ --coordinator workspace:0); : > $S/xcrun.log
 ok $S/bin/orch end-run --run $SM --status aborted                                  # no --keep-sim: last run ends
 ok grep -qx reap $S/orch-sim.log
 no grep -q shutdown $S/xcrun.log
-SM=$($O new-run --repo $R --title sm2 --coordinator workspace:0); ok $O end-run --run $SM --status aborted   # no orch-sim beside it
+SM=$($O new-run --repo $R --title sm2$$ --coordinator workspace:0); ok $O end-run --run $SM --status aborted   # no orch-sim beside it
 ok $O reap; no grep -q shutdown $S/xcrun.log
 
 echo; echo "PASSED $PASS  FAILED $FAIL"; [ $FAIL = 0 ]

@@ -28,7 +28,7 @@ Tier S skips all of this (one confirmation, edit, gates, lite review rounds, pus
 4. **Review rounds.** Each round reviews one gated, squashed commit with fresh agents; the slice's review tier (table in `skills/worker/SKILL.md` §4) picks them:
    - Round 1 and the final round are full; code and risky rounds in between review only the cumulative fix diff since round 1, plus the previous blockers. Agents read the recorded gate logs instead of re-running the suites.
    - a `/code-review` finding blocks only on lines this diff changes, with a concrete failure; otherwise it is advisory, or rejected with a quote;
-   - anything blocking → fix every blocking finding at the root cause plus the advisories inside the slice's files, re-gate, next round;
+   - anything blocking → fix every blocking finding at the root cause (advisories inside the slice's files may ride along; a pre-existing defect goes to the coordinator as a fix-slice question instead), re-gate, next round;
    - a clean full round → the `verifier` runs. PASS → integrate; FAILURE → fix and another round.
    - Same finding in two consecutive rounds → `QUESTION` to the coordinator, which asks you. Blocking or a verifier FAILURE at the cap → one `oracle` consult, `## Learned` notes, `BLOCKED`.
 5. **Integrate.** Rebase on the target branch (gates again; verifier in specs-only mode if the patch is unchanged, a full new round if it changed), `orch gates-ok`, take the merge lock **as its own command**, plain `git push origin HEAD:<target>`, `orch merged`, unlock, report `MERGED`.

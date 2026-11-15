@@ -12,15 +12,18 @@ Files/locks:  lock, unlock, locks, resource-lock, resource-unlock
 Health:       doctor (--fix), reap, status, report, dash, note, gc (deletes ended runs' bulk)
 Worker:       register, gates, verdict, criterion, gates-ok, merge-lock, merge-unlock, merged
 Tier S:       tier (main checkout: gates + lite reviewer PASS, then push)
-Env: ORCH_HOME (state dir), ORCH_CMUX (cmux binary, default `cmux`), ORCH_PORT_BASE/ORCH_PORT_SPAN.
+Env: ORCH_HOME (state dir), ORCH_CMUX (cmux binary, default `cmux`), ORCH_PORT_BASE/ORCH_PORT_SPAN,
+     ORCH_CAFFEINATE (the `caffeinate` that keeps the Mac awake during a run; default: `caffeinate`, but only for
+     the default ~/.claude/orchestra: any other ORCH_HOME, e.g. a test or probe, holds none unless this is set).
 Run `orch <cmd> -h` for flags.
 """
-import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time
+import argparse, contextlib, fcntl, hashlib, json, os, pwd, re, shlex, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 HOME = Path(os.environ.get("ORCH_HOME", Path.home() / ".claude" / "orchestra"))
 RUNS, LOCKS, EVENTS = HOME / "runs", HOME / "locks", HOME / "events"
 CAFF_PID = HOME / "state" / "caffeinate.pid"  # one `caffeinate -is` shared by every active run
+CAFF_BIN = HOME / "state" / "caffeinate.bin"  # the name it was started as (ORCH_CAFFEINATE may differ per shell)
 PORT_HISTORY = HOME / "state" / "port-history"  # <base>.json: the last owner a block was handed to (outlives release)
 MERGE_LOCK_MAX_SECS = 20 * 60          # lock covers only rebase+push, so this is generous
 PORT_BLOCK = 10                        # each worker gets its own 10-port block
@@ -29,6 +32,14 @@ PORT_BASE = int(os.environ.get("ORCH_PORT_BASE", 20000))
 PORT_MAX = PORT_BASE + int(os.environ.get("ORCH_PORT_SPAN", 9990))
 PASS_ROLES = ("reviewer", "verifier")  # + "adversarial" when the worker is registered --risky
 CMUX = os.environ.get("ORCH_CMUX") or "cmux"  # tests point this at a stub; every cmux call goes through it
+# The real caffeinate only for the user's own state dir (by the account's home, not $HOME, which tests fake): an
+# isolated ORCH_HOME (suite, probe) that started one and was then deleted left it running forever, untraceable.
+try:
+    DEFAULT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude" / "orchestra"
+except KeyError:  # an account with no passwd entry (some containers): no default home, so only ORCH_CAFFEINATE holds
+    DEFAULT_HOME = None
+CAFFEINATE = os.environ.get("ORCH_CAFFEINATE") or (
+    "caffeinate" if DEFAULT_HOME and os.path.realpath(HOME) == os.path.realpath(DEFAULT_HOME) else None)
 LOCK_GRACE_SECS = 60                   # a lock dir with no owner.json is held this long (legacy/crashed taker)
 IDLE_RUN_SECS = 12 * 3600              # reap flags an active run with no active worker for this long
 
@@ -146,16 +157,78 @@ def cmux_workspace():
     return cmux_identify().get("surface_ref")
 
 
-def cmux_live_workspaces():
-    """Every live workspace and surface ref across all windows."""
-    try:
+def cmux_nodes():
+    """Every live workspace and surface across all windows: {ref: (uuid or None, title, its workspace ref)}, or None
+    when cmux can't tell (no cmux, not running, hung, unreadable): unknown, never "everyone is dead".
+    Short refs (workspace:N) are reused once a workspace closes; the uuid (`--id-format both`) is stable."""
+    r = cmux("tree", "--all", "--json", "--id-format", "both")
+    if r.returncode not in (0, 124, 127):  # a cmux from before --id-format: refs only (missing/hung: no second try)
         r = cmux("tree", "--all", "--json")
-        if r.returncode != 0:  # no cmux, not running, hung: unknown — never "everyone is dead"
-            return None
-        out = r.stdout
-        return set(re.findall(r'"ref"\s*:\s*"((?:workspace|surface):\d+)"', out))
-    except Exception:
-        return None  # unknown → never treat anyone as dead
+    if r.returncode != 0:
+        return None
+    try:
+        tree = json.loads(r.stdout)
+    except ValueError:
+        return None
+    nodes = {}
+    def walk(o, ws):
+        if isinstance(o, dict):
+            ref = o.get("ref")
+            if isinstance(ref, str) and re.fullmatch(r"(?:workspace|surface):\d+", ref):
+                ws = ref if ref.startswith("workspace:") else ws
+                uid = o.get("id")
+                nodes[ref] = (uid if isinstance(uid, str) and uid else None, o.get("title"), ws)
+            for v in o.values():
+                walk(v, ws)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, ws)
+    walk(tree, None)
+    return nodes
+
+
+def cmux_live_workspaces(nodes=False):
+    """Every live workspace and surface ref and uuid across all windows (None: unknown). nodes: cmux_nodes() already read."""
+    nodes = cmux_nodes() if nodes is False else nodes
+    if nodes is None:
+        return None
+    return set(nodes) | {uid for uid, _, _ in nodes.values() if uid}
+
+
+def has_ids(live):
+    """The live set can vouch for a uuid: its tree lists uuids, or lists nothing at all (then nobody is alive).
+    False for a tree of refs only (a cmux from before --id-format)."""
+    return not live or any(not re.fullmatch(r"(?:workspace|surface):\d+", x) for x in live)
+
+
+def worker_live(wk, live):
+    """The worker's pane is live: by its surface uuid when spawn recorded one and the tree lists uuids (a reused
+    surface:N is someone else's), else by its ref (records from before ids, or a cmux that lists no uuids: a listed
+    ref may be reused, so it reads as alive — never the other way round). live None (unknown) → True."""
+    if live is None:
+        return True
+    if wk.get("surface_id") and has_ids(live):
+        return wk["surface_id"] in live
+    return wk.get("workspace") in live
+
+
+def close_target(ref, uid, title, nodes):
+    """(what to pass to `workspace close`, why it is skipped, retry) for a workspace orchestra opened as `ref`/`uid`
+    named `title`. With its uuid: that uuid while it is live (a uuid can't name anyone else). Without one (opened before
+    ids were recorded, or a cmux that lists none): the ref only while it still names a workspace titled `title` — a
+    reused workspace:N is someone else's. retry: it couldn't be told, so the cleanup isn't finished. (None, None,
+    False): already gone."""
+    live = cmux_live_workspaces(nodes)
+    if uid and (live is None or has_ids(live)):
+        return (uid if live is None or uid in live else None), None, False
+    if nodes is None:
+        return None, f"{ref} skipped: cmux unreadable and no stable id to close it by", True
+    if ref not in nodes:
+        return None, None, False
+    node_id, now_title, _ = nodes[ref]
+    if now_title == title:
+        return node_id or ref, None, False
+    return None, f"{ref} skipped: it now names another workspace ({now_title or 'untitled'})", False
 
 
 def cmux_group_for(workspace, key, name):
@@ -176,30 +249,12 @@ def cmux_group_for(workspace, key, name):
     return m.group(0) if m else None
 
 
-def cmux_first_surface(workspace):
-    """First surface ref inside `workspace` (the terminal a new workspace starts with)."""
-    def walk(o, inside):
-        if isinstance(o, dict):
-            ref = str(o.get("ref", ""))
-            if ref.startswith("workspace:"):
-                inside = ref == workspace
-            if inside and ref.startswith("surface:"):
-                return ref
-            for v in o.values():
-                hit = walk(v, inside)
-                if hit:
-                    return hit
-        elif isinstance(o, list):
-            for v in o:
-                hit = walk(v, inside)
-                if hit:
-                    return hit
-        return None
-    try:
-        out = cmux("tree", "--all", "--json").stdout
-        return walk(json.loads(out), False)
-    except Exception:
-        return None
+def cmux_first_surface(workspace, nodes):
+    """(ref, uuid) of the first surface inside `workspace` (the terminal a new workspace starts with), or (None, None)."""
+    for ref, (uid, _, ws) in (nodes or {}).items():
+        if ref.startswith("surface:") and ws == workspace:
+            return ref, uid
+    return None, None
 
 
 def port_in_use(p):
@@ -277,19 +332,26 @@ def caffeinate_pid():
     except (FileNotFoundError, ValueError):
         return None
     cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
-    return pid if re.search(r"\bcaffeinate -is\s*$", cmd) else None
+    try:
+        started = CAFF_BIN.read_text().strip()
+    except OSError:
+        started = ""
+    # ORCH_CAFFEINATE may name another binary, and a later call may run without it: the recorded name counts too
+    names = {"caffeinate", os.path.basename(CAFFEINATE or "caffeinate")} | ({started} if started else set())
+    return pid if re.search(rf"(?:^|[\s/])(?:{'|'.join(map(re.escape, names))}) -is\s*$", cmd) else None
 
 
 def caffeinate_hold():
     """Keep the Mac awake while any run is active (idempotent across runs)."""
-    if caffeinate_pid():
+    if not CAFFEINATE or caffeinate_pid():
         return
     try:
-        p = subprocess.Popen(["caffeinate", "-is"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        p = subprocess.Popen([CAFFEINATE, "-is"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except FileNotFoundError:
         return
     CAFF_PID.parent.mkdir(parents=True, exist_ok=True)
+    CAFF_BIN.write_text(os.path.basename(CAFFEINATE))
     CAFF_PID.write_text(str(p.pid))
 
 
@@ -301,6 +363,7 @@ def caffeinate_release():
         except ProcessLookupError:
             pass
     CAFF_PID.unlink(missing_ok=True)
+    CAFF_BIN.unlink(missing_ok=True)
     return bool(pid)
 
 
@@ -390,8 +453,11 @@ def cmd_baseline(a):
 def cmd_add_worker(a):
     d = RUNS / a.run
     r = read_json(d / "run.json") or sys.exit(f"orch: no run {a.run}")
+    # a pane's own uuid only: a workspace's would later be sent to close-surface
+    node = (cmux_nodes() or {}).get(a.workspace) if have_cmux() and a.workspace.startswith("surface:") else None
     write_json(d / "workers" / f"{a.slice}.json", {
         "run": a.run, "slice": a.slice, "name": f"{a.run}-{a.slice}", "workspace": a.workspace,
+        "surface_id": node[0] if node else None,  # stable: close/liveness/messages use it (a surface:N is reused)
         "target": r["target"], "status": "active", "started": now()})
     print(f"{a.run}-{a.slice} → pushes to {r['target']}")
 
@@ -499,7 +565,7 @@ def cmd_doctor(a):
         slugs.add(r["repo_slug"])
         print(f"{r['id']}  coord={r.get('coordinator')}  target={r.get('target')}")
         for w, wk in workers_of(run_dir):
-            alive = live is None or wk.get("workspace") in live
+            alive = worker_live(wk, live)
             prog = run_dir / "slices" / f"{wk['slice']}.progress.md"
             age = int(time.time() - prog.stat().st_mtime) if prog.exists() else None
             print(f"   {wk['slice']:18} {'alive' if alive else 'DEAD '}  progress {'never' if age is None else f'{age // 60}m ago'}")
@@ -606,13 +672,15 @@ def cmd_spawn(a):
     res = cmux(*args[1:], timeout=None)  # no timeout: a late reply would leave an untracked worker running
     out = res.stdout.strip()
     wm = re.search(r"workspace:\d+", out)
-    surface = cmux_first_surface(wm.group(0)) if wm else None
+    nodes = cmux_nodes() if wm else None
+    surface, surface_id = cmux_first_surface(wm.group(0), nodes) if wm else (None, None)
     if not surface:
         release_ports(name)
         sys.exit(f"orch: could not read the new workspace's surface from: {out or '(no output)'}"
                  + (f" — cmux said: {res.stderr.strip()}" if res.stderr.strip() else ""))
     write_json(d / "workers" / f"{a.slice}.json", {
         "run": a.run, "slice": a.slice, "name": name, "workspace": surface, "ws_ref": wm.group(0), "target": r["target"],
+        "ws_id": nodes[wm.group(0)][0] if wm.group(0) in nodes else None, "surface_id": surface_id,  # stable: close/liveness use these
         "ports": [port, port + PORT_BLOCK - 1], "lean_mcp": bool(lean), "status": "active", "started": now()})
     msg = open_dash(a.run)
     if msg:
@@ -745,13 +813,51 @@ def sweep(pids=(), ports=None, paths=(), prefixes=(), others=(), dry=False):
     return targets, mb
 
 
+LEFTOVERS = HOME / "state" / "worktree-leftovers.json"  # worktrees whose removal failed halfway, to finish later
+
+
+def remove_worktree(root, wt):
+    """git worktree remove --force --force. A remove that fails halfway (a file it couldn't delete) has already dropped
+    git's record, so every later remove says "not a working tree" and the directory would stay forever. So: a
+    directory that was this repo's worktree (its .git points into this repo's worktrees/) and survives the remove is
+    remembered, and what is left of it is deleted once git no longer lists it — now or on a retry, even if its .git
+    went too. Any other directory at that path is never deleted."""
+    real = os.path.realpath(wt)
+    dot = Path(wt) / ".git"
+    try:
+        m = re.match(r"gitdir:\s*(.+)", dot.read_text().strip()) if dot.is_file() else None
+    except OSError:
+        m = None
+    common = os.path.realpath(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False) or "/nonexistent")
+    ours = bool(m) and os.path.dirname(os.path.realpath(os.path.join(wt, m.group(1)))) == os.path.join(common, "worktrees")
+    ident = lambda: (lambda st: [st.st_dev, st.st_ino])(os.stat(wt)) if os.path.isdir(wt) else None
+    before = ident()
+    git(root, "worktree", "remove", "--force", "--force", wt, check=False)
+    LEFTOVERS.parent.mkdir(parents=True, exist_ok=True)
+    with open(f"{LEFTOVERS}.lock", "a") as lock:  # concurrent end-run / reap: never lose an entry
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # an entry names one directory (path + dev/inode): one removed by hand and made again there is someone else's
+        left = [e for e in (read_json(LEFTOVERS, []) or []) if isinstance(e, dict) and os.path.isdir(e.get("path", ""))]
+        now_id = ident()
+        known = any(e["path"] == real and e.get("id") == now_id for e in left)
+        if now_id and (ours or known):
+            lst = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=root, capture_output=True, text=True)
+            listed = {os.path.realpath(x[len("worktree "):]) for x in lst.stdout.splitlines() if x.startswith("worktree ")}
+            if lst.returncode == 0 and real not in listed:  # git couldn't answer: never delete on a guess
+                shutil.rmtree(wt, ignore_errors=True)
+        now_id = ident()
+        left = [e for e in left if e["path"] != real]
+        if now_id and (known or (ours and now_id == before)):
+            left.append({"path": real, "id": now_id})
+        write_json(LEFTOVERS, left)
+
+
 def cleanup_worker(r, wk, full=True, dry=False, names=None):
     """full: close pane, kill its processes, remove worktree/branch/derived data, release locks+ports.
     not full (dead worker): kill leftover processes only, keep the worktree so it can resume.
     names: owner_names(), when the caller cleans several workers."""
     name, root = wk["name"], r["repo"]
     wt = f"{root}/.claude/worktrees/{name}"
-    live = cmux_live_workspaces()
     did = []
     ports = tuple(wk["ports"]) if wk.get("ports") else None
     if ports:  # sweep the block only while this worker still holds it: once released (or handed to someone else)
@@ -762,17 +868,31 @@ def cleanup_worker(r, wk, full=True, dry=False, names=None):
     others = {f"/tmp/{o}" for o in (owner_names() if names is None else names) if o != name}
     tmp = dict(paths=(wt,), prefixes=(f"/tmp/{name}",), others=others)
     _, before_mb = sweep(ports=ports, **tmp, dry=True)  # measure before the pane closes
-    if full and wk.get("workspace") and have_cmux() and (live is None or wk["workspace"] in live):
-        did.append("pane")
-        if not dry:
-            if wk.get("ws_ref"):
-                args = ["workspace", "close", "--workspace", wk["ws_ref"], "--force"]
-            else:  # older workers opened as panes in the coordinator's workspace
-                args = ["close-surface", "--surface", wk["workspace"], "--force"]
-                if r.get("coordinator_workspace"):
-                    args += ["--workspace", r["coordinator_workspace"]]
-            cmux(*args, timeout=30)
-            time.sleep(2)  # the live session locks the worktree until it exits
+    if full and wk.get("workspace") and have_cmux():
+        nodes = cmux_nodes()
+        if wk.get("ws_ref"):
+            target, skip, retry = close_target(wk["ws_ref"], wk.get("ws_id"), name, nodes)
+            args = ["workspace", "close", "--workspace", target, "--force"]
+        else:  # a pane (orch add-worker, or older workers opened in the coordinator's workspace): only its surface
+            # uuid can name it — a pane's title is the terminal's, so a reused surface:N can't be told from its own
+            live = cmux_live_workspaces(nodes)
+            uid, retry = wk.get("surface_id"), False
+            if uid and (live is None or has_ids(live)):  # a uuid names nobody else: close it even if cmux can't list
+                target, skip = (uid if live is None or uid in live else None), None
+            elif uid:
+                target, skip, retry = None, f"{wk['workspace']} skipped: cmux lists no stable ids to close it by", True
+            else:
+                target, skip = None, f"{wk['workspace']} skipped: a pane recorded without a stable id"
+            args = ["close-surface", "--surface", target, "--force"]
+        if skip:
+            did.append(f"pane {skip}")
+        if retry:
+            did.append("pane unverified")
+        if target:
+            did.append("pane")
+            if not dry:
+                cmux(*args, timeout=30)
+                time.sleep(2)  # the live session locks the worktree until it exits
     killed, mb = sweep(ports=ports, **tmp, dry=dry)
     mb = max(mb, before_mb)
     if killed or mb >= 1:
@@ -781,7 +901,7 @@ def cleanup_worker(r, wk, full=True, dry=False, names=None):
         if Path(wt).exists():
             did.append("worktree")
             if not dry:
-                git(root, "worktree", "remove", "--force", "--force", wt, check=False)
+                remove_worktree(root, wt)
         if not dry:
             git(root, "branch", "-D", f"worktree-{name}", check=False)
             own = path_re(f"/tmp/{name}", prefix=True, others=others)
@@ -1003,9 +1123,11 @@ def cleanup_complete(r, wk, did):
     out, or a worktree git couldn't remove, is retried by the next reap)."""
     if Path(f"{r['repo']}/.claude/worktrees/{wk['name']}").exists():
         return False
+    if "pane unverified" in did:  # couldn't tell whose the pane is: try again next reap
+        return False
     if "pane" in did:
         live = cmux_live_workspaces()
-        return live is not None and wk.get("workspace") not in live
+        return live is not None and not worker_live(wk, live)
     return True
 
 
@@ -1017,7 +1139,7 @@ def cmd_reap(a):
         r = read_json(d / "run.json") or {}
         for w, wk in workers_of(d, status=None):
             if wk.get("status") == "active":
-                if live is not None and wk.get("workspace") not in live:
+                if not worker_live(wk, live):
                     if not a.dry_run:
                         wk.update(status="dead", died=now())
                         write_json(w, wk)
@@ -1047,6 +1169,18 @@ def cmd_reap(a):
             if did:
                 lines.append(f"{wk['name']} ({wk.get('status')}): {', '.join(did)}")
                 total += mb
+        integ = {"name": f"{d.name}-integrate", "ports": None}
+        if r.get("status") not in (None, "active") and r.get("repo") and Path(r["repo"]).exists() and (
+                Path(f"{r['repo']}/.claude/worktrees/{integ['name']}").exists()
+                or git(r["repo"], "rev-parse", "-q", "--verify", f"refs/heads/{integ['name']}", check=False)):
+            # an ended run whose integration end-run couldn't remove (NOT finished): retry it like a worker
+            did, mb = cleanup_worker(r, integ, full=True, dry=a.dry_run, names=names)
+            if not a.dry_run:
+                git(r["repo"], "branch", "-D", integ["name"], check=False)
+            left = not a.dry_run and not cleanup_complete(r, integ, did)
+            lines.append(f"{integ['name']} (run {r.get('status')}): {', '.join(did) or 'branch'}"
+                         + (f" — still NOT finished, retry with orch reap --run {d.name}" if left else ""))
+            total += mb
         if r.get("repo") and Path(r["repo"]).exists() and not a.dry_run:
             git(r["repo"], "worktree", "prune", check=False)
     orphans = orphan_listeners(dry=a.dry_run)
@@ -1115,14 +1249,21 @@ def cmd_end_run(a):
     integ = {"name": f"{a.run}-integrate", "ports": None}
     did, mb = cleanup_worker(r, integ, full=True, names=names)
     total += mb
-    if did:
+    if not cleanup_complete(r, integ, did):  # like a worker: say so, and reap --run retries it
+        print(f"NOT finished {integ['name']}: {', '.join(did) or 'nothing'} tried, worktree left — "
+              f"retry with orch reap --run {a.run}")
+    elif did:
         print(f"cleaned {integ['name']}: {', '.join(did)}")
     git(r["repo"], "branch", "-D", f"{a.run}-integrate", check=False)
     git(r["repo"], "worktree", "prune", check=False)
     if r.get("target", "").startswith("orch/"):
         git(r["repo"], "push", "--quiet", "origin", f":refs/heads/{r['target']}", check=False)
-    if r.get("dash_ws"):
-        cmux("workspace", "close", "--workspace", r["dash_ws"], "--force", timeout=30)
+    if r.get("dash_ws") and have_cmux():
+        target, skip, _ = close_target(r["dash_ws"], r.get("dash_id"), f"{a.run} dashboard", cmux_nodes())
+        if target:
+            cmux("workspace", "close", "--workspace", target, "--force", timeout=30)
+        elif skip:
+            print(f"dashboard {skip}")
     g = r.get("group")
     shared = g and any(x.get("group") == g or (r.get("coordinator_workspace") and x.get("coordinator_workspace")
                                                  == r["coordinator_workspace"]) for x in active_runs(except_run=a.run))
@@ -1168,7 +1309,7 @@ def cmd_broadcast(a):
     for _, wk in workers_of(d):
         if a.branch and wk.get("target") != a.branch:
             continue
-        (sent if cmux_message(wk.get("workspace"), a.text, "coordinator") else failed).append(wk["name"])
+        (sent if cmux_message(wk.get("surface_id") or wk.get("workspace"), a.text, "coordinator") else failed).append(wk["name"])
     print(f"sent to: {', '.join(sent) or '-'}" + (f"; UNDELIVERED: {', '.join(failed)}" if failed else ""))
 
 
@@ -1191,7 +1332,7 @@ def cmd_report(a):
             last, age = (lines[-1] if lines else ""), int((time.time() - prog.stat().st_mtime) // 60)
         if not wk:
             state = "queued"
-        elif wk["status"] == "active" and live is not None and wk.get("workspace") not in live:
+        elif wk["status"] == "active" and not worker_live(wk, live):
             state = "DEAD"
         else:
             state = wk["status"]
@@ -1284,7 +1425,7 @@ def _dash_frame(run):
         step = max([int(mm.group(1)) for ln in lines for mm in [re.search(r"\bstep (\d+)", ln)] if mm] or [0])
         active = bool(wk and wk["status"] == "active")
         if active:
-            dead = live is not None and wk.get("workspace") not in live
+            dead = not worker_live(wk, live)
             stalled = age is not None and age >= 15
             dot = f"{R_}✗ DEAD{X}" if dead else f"{Y}● STALLED{X}" if stalled else f"{G}●{X}"
             label = dict(WORKER_STEPS).get(step, "starting")
@@ -1360,8 +1501,15 @@ def open_dash(run):
     """Open the dashboard as its own workspace in the coordinator's group (once per run)."""
     d = RUNS / run
     r = read_json(d / "run.json") or sys.exit(f"orch: no run {run}")
-    live = cmux_live_workspaces()
-    if r.get("dash_ws") and (live is None or r["dash_ws"] in live):  # unknown liveness: never open a second one
+    nodes = cmux_nodes()
+    live = cmux_live_workspaces(nodes)
+    if r.get("dash_id"):  # by its uuid (or its ref, on a cmux that lists none); unknown: never open a second one
+        there = worker_live({"surface_id": r["dash_id"], "workspace": r["dash_ws"]}, live)
+    elif r.get("dash_ws"):  # recorded before ids: still ours only while that ref has the dashboard's title
+        there = nodes is None or (nodes.get(r["dash_ws"]) or (None, None))[1] == f"{run} dashboard"
+    else:
+        there = False
+    if there:
         return None
     ws = r.get("coordinator_workspace")
     group = cmux_group_for(ws, run, f"{Path(r['repo']).name} · {r.get('title', run)}") if ws else None
@@ -1378,6 +1526,7 @@ def open_dash(run):
             write_json(d / "run.json", r)
         return f"orch: could not open dashboard: {out.strip()}"
     r["dash_ws"] = m.group(0)
+    r["dash_id"] = ((cmux_nodes() or {}).get(m.group(0)) or (None,))[0]  # end-run closes it by this stable id
     write_json(d / "run.json", r)
     return f"dashboard → {m.group(0)}" + (f" in {group}" if group else "")
 

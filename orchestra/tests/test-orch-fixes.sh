@@ -5,10 +5,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -u
 S=$(mktemp -d "${TMPDIR:-/tmp}/orchestra-test-orch-fixes.XXXXXX"); trap 'for c in $(cat $S/caff.log 2>/dev/null); do kill $c 2>/dev/null; done; rm -rf $S' EXIT; cd $S  # unique: suites run concurrently
 O=$ROOT/bin/orch
-export ORCH_PORT_BASE=$((30000 + $$ % 300 * 100)) ORCH_PORT_SPAN=90  # private port range: suites never share a block
+export ORCH_PORT_BASE=${ORCH_TEST_PORT_BASE:-$((30000 + $$ % 300 * 100))} ORCH_PORT_SPAN=90  # private port range: suites never share a block
 mkdir -p $S/stub; export CAFF_LOG=$S/caff.log FAKE_LOG=$S/fake.log PATHCMUX_LOG=$S/pathcmux.log CLAUDE_LOG=$S/claude.log
 # caffeinate stub: matches orch's `caffeinate -is` check, idles until TERM
-printf '#!/bin/sh\necho $$ >> "$CAFF_LOG"\nsleep 120 & trap "kill $! 2>/dev/null; exit" TERM\nwait\n' > $S/stub/caffeinate
+printf '#!/bin/sh\ntrap '"'"'kill $! 2>/dev/null; exit'"'"' TERM\necho $$ >> "$CAFF_LOG"\nsleep 120 & wait\n' > $S/stub/caffeinate  # trap first: no orphan sleep
 for x in xcrun osascript; do printf '#!/bin/sh\nexit 0\n' > $S/stub/$x; done
 printf '#!/bin/sh\necho "$*" >> "$PATHCMUX_LOG"\nexit 1\n' > $S/stub/cmux               # the cmux on PATH: must not be used when ORCH_CMUX is set
 printf '#!/bin/sh\necho "$*" >> "$CLAUDE_LOG"\nexit 0\n' > $S/stub/claude
@@ -18,14 +18,14 @@ cat > $S/fakecmux <<'EOF'
 echo "$*" >> "$FAKE_LOG"
 case "$1 $2" in
   "identify --json") [ -n "${IDENT_SLEEP:-}" ] && sleep "$IDENT_SLEEP"; echo '{"caller":{"surface_ref":"surface:77","workspace_ref":"workspace:7"}}';;
-  "tree --all") [ -n "${TREE_FAIL:-}" ] && exit 1; [ -n "${TREE_SLEEP:-}" ] && sleep "$TREE_SLEEP"; echo '{"windows":[{"workspaces":[{"ref":"workspace:5","panes":[{"ref":"surface:51"}]},{"ref":"workspace:7","panes":[{"ref":"surface:77"}]}]}]}';;
+  "tree --all") [ -n "${TREE_FAIL:-}" ] && exit 1; [ -n "${TREE_SLEEP:-}" ] && sleep "$TREE_SLEEP"; echo '{"windows":[{"workspaces":[{"ref":"workspace:5","id":"W5","panes":[{"ref":"surface:51","id":"S51"}]},{"ref":"workspace:7","id":"W7","panes":[{"ref":"surface:77","id":"S77"}]}]}]}';;
   "new-workspace "*) [ -n "${FAIL_NEW:-}" ] && { echo "error: $FAIL_NEW" >&2; exit 1; }; echo "OK workspace:5";;
   "workspace-group list") echo '{"groups":[]}';;
   "workspace-group create") echo "OK workspace_group:9";;
 esac
 exit 0
 EOF
-chmod +x $S/stub/* $S/fakecmux; export PATH=$S/stub:$PATH FAKE=$S/fakecmux
+chmod +x $S/stub/* $S/fakecmux; export PATH=$S/stub:$PATH FAKE=$S/fakecmux ORCH_CAFFEINATE=$S/stub/caffeinate  # an isolated ORCH_HOME holds none otherwise
 mkdir -p $S/pybin; ln -s "$(command -v python3)" $S/pybin/python3; ln -s "$(command -v git)" $S/pybin/git
 NOCMUX_PATH=$S/pybin:/usr/bin:/bin:/usr/sbin:/sbin                                                 # no cmux anywhere on it
 P=0; F=0
@@ -83,7 +83,7 @@ ok "failed new-workspace: cmux stderr shown, no worker, ports released" '[ $rc !
 ok "ORCH_CMUX set → PATH cmux never called" '[ ! -s $PATHCMUX_LOG ]'
 ok "worker registered with fake surface" '[ "$(jget $D/workers/B.json workspace)" = surface:51 ]'
 : > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O broadcast --run $RUN "hello"
-ok "broadcast uses ORCH_CMUX" '[ $rc = 0 ] && grep -q "^agent message surface:51" $FAKE_LOG && [ ! -s $PATHCMUX_LOG ]'
+ok "broadcast uses ORCH_CMUX, to the surface uuid" '[ $rc = 0 ] && grep -q "^agent message S51 " $FAKE_LOG && [ ! -s $PATHCMUX_LOG ]'
 : > $FAKE_LOG; run env ORCH_CMUX=$FAKE $O doctor
 ok "doctor reads liveness through ORCH_CMUX" 'grep -q "^tree --all" $FAKE_LOG && grep -qE "B +alive" <<< "$out"'
 
