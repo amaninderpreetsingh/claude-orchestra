@@ -3,7 +3,8 @@
 Write the task in the command; this file answers the interview so the run needs no input.
 Each question is a `## Q:` heading with its answer below it. Questions are matched by meaning,
 so write them the way you expect to be asked. Anything not covered → the recommended option,
-logged under Decisions. `approve: yes` approves every spec, tier confirmation and push.
+logged under Decisions. `approve: yes` approves the fast-path confirmation, the plan, every merge
+that waits for your OK (risky tasks, `manual` merge policy) and the push.
 
 approve: yes
 
